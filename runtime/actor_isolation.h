@@ -39,6 +39,19 @@
  */
 int actor_isolation_apply(void);
 
+/* Stack a narrower Landlock domain on the calling process, from
+ * ACTOR_RESTRICT_RO / ACTOR_RESTRICT_RW / ACTOR_RESTRICT_NET_CONNECT.
+ *
+ * For a handler that needs to keep a capability while denying it to whatever
+ * it spawns: open the connection, call this, then spawn. Landlock governs
+ * opening and connecting, not descriptors already held, so the parent keeps
+ * what it has and the child cannot obtain it. Domains nest, so this can only
+ * narrow -- never widen, whatever the environment says.
+ *
+ * Returns 0 if everything requested was applied (including nothing requested),
+ * -1 if anything requested could not be. */
+int actor_isolation_restrict(void);
+
 /* Apply the tuple-lifetime isolation named in ACTOR_TUPLE_UNSHARE.
  *
  * Call in the forked child, before exec. The namespaces are created per tuple

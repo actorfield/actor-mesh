@@ -700,10 +700,22 @@ static int path_covered(const char* path, const char* list) {
     return 0;
 }
 
-static int apply_landlock(void) {
-    const char* ro  = getenv("ACTOR_LANDLOCK_RO");
-    const char* rw  = getenv("ACTOR_LANDLOCK_RW");
-    const char* net = getenv("ACTOR_LANDLOCK_NET_CONNECT");
+/* Build one Landlock ruleset from three lists and enforce it on this process.
+ *
+ * Split out of apply_landlock so the same code can enforce a SECOND, narrower
+ * domain later in a descendant -- see actor_isolation_restrict(). Landlock
+ * domains nest: a process already inside one can create another, and the
+ * effective rights are the intersection. So this can only ever remove access,
+ * which is what makes stacking safe to expose.
+ *
+ * `var_ro`/`var_rw`/`var_net` name the variables the values came from, purely
+ * so an error message points at the knob the operator actually set.
+ * `check_lmdb` belongs to the startup call only: a descendant is not the
+ * process that opens the database.
+ */
+static int build_and_restrict(const char* ro, const char* rw, const char* net,
+                              const char* var_ro, const char* var_rw,
+                              const char* var_net, int check_lmdb) {
     if (!ro && !rw && !net) return 0;
 
     /* Negotiate the ABI. The kernel reports the highest version it supports;
@@ -718,8 +730,9 @@ static int apply_landlock(void) {
         return -1;
     }
     if (net && abi < 4) {
-        fprintf(stderr, "[actor] isolation: ACTOR_LANDLOCK_NET_CONNECT needs "
-                        "landlock ABI 4 (kernel 6.7+); this kernel reports ABI %ld\n", abi);
+        fprintf(stderr, "[actor] isolation: %s needs "
+                        "landlock ABI 4 (kernel 6.7+); this kernel reports ABI %ld\n",
+                var_net, abi);
         return -1;
     }
 
@@ -727,6 +740,13 @@ static int apply_landlock(void) {
        or landlock_create_ruleset rejects the whole attr. Build it up by ABI. */
     uint64_t fs_handled = LL_RW;
     if (abi < 3) fs_handled &= ~(uint64_t)LANDLOCK_ACCESS_FS_TRUNCATE;
+
+    /* Handling filesystem access while adding no path rule denies the whole
+       filesystem -- that is the "no ambient allow" property this file relies
+       on everywhere else. Harmless when ro/rw are set, fatal when they are
+       not: a caller restricting only outbound TCP would silently lose every
+       path as well. So handle the filesystem only when a path list says to. */
+    if (!ro && !rw) fs_handled = 0;
     /* REFER (ABI 2+) is deliberately not handled: it is always denied without
        an explicit rule, and handling it would break rename/link inside a
        single rw subtree, which handlers legitimately do. */
@@ -752,14 +772,15 @@ static int apply_landlock(void) {
     /* The actor opens its own LMDB after this ruleset is enforced. A path
        outside the rw set turns into an opaque LMDB failure at startup, so
        catch it here where the message can name the actual problem. */
-    const char* lmdb = getenv("ACTOR_LMDB_PATH");
+    const char* lmdb = check_lmdb ? getenv("ACTOR_LMDB_PATH") : NULL;
     if (lmdb && !path_covered(lmdb, rw)) {
         fprintf(stderr, "[actor] isolation: ACTOR_LMDB_PATH=\"%s\" is not inside "
-                        "ACTOR_LANDLOCK_RW=\"%s\" -- the actor could not open its "
-                        "own database\n", lmdb, rw ? rw : "");
+                        "%s=\"%s\" -- the actor could not open its "
+                        "own database\n", lmdb, var_rw, rw ? rw : "");
         close(rs);
         return -1;
     }
+    (void)var_ro;
 
     if (for_each_path(ro, rs, LL_RO, ll_add_path) < 0) { close(rs); return -1; }
     if (for_each_path(rw, rs, fs_handled, ll_add_path) < 0) { close(rs); return -1; }
@@ -768,7 +789,7 @@ static int apply_landlock(void) {
     if (net && abi >= 4) {
         char buf[1024];
         if (strlen(net) >= sizeof(buf)) {
-            fprintf(stderr, "[actor] isolation: ACTOR_LANDLOCK_NET_CONNECT too long\n");
+            fprintf(stderr, "[actor] isolation: %s too long\n", var_net);
             close(rs); return -1;
         }
         strcpy(buf, net);
@@ -778,8 +799,8 @@ static int apply_landlock(void) {
             if (!*t) continue;
             unsigned long long port;
             if (parse_ull(t, &port) || port > 65535) {
-                fprintf(stderr, "[actor] isolation: bad port \"%s\" in "
-                                "ACTOR_LANDLOCK_NET_CONNECT\n", t);
+                fprintf(stderr, "[actor] isolation: bad port \"%s\" in %s\n",
+                        t, var_net);
                 close(rs); return -1;
             }
             struct landlock_net_port_attr np = {
@@ -809,6 +830,38 @@ static int apply_landlock(void) {
     fprintf(stderr, "[actor] isolation: landlock abi=%ld ro=%s rw=%s net=%s\n",
             abi, ro ? ro : "-", rw ? rw : "-", net ? net : "-");
     return 0;
+}
+
+static int apply_landlock(void) {
+    return build_and_restrict(getenv("ACTOR_LANDLOCK_RO"),
+                              getenv("ACTOR_LANDLOCK_RW"),
+                              getenv("ACTOR_LANDLOCK_NET_CONNECT"),
+                              "ACTOR_LANDLOCK_RO", "ACTOR_LANDLOCK_RW",
+                              "ACTOR_LANDLOCK_NET_CONNECT", 1);
+}
+
+/* Stack a narrower Landlock domain on the CALLING process.
+ *
+ * Unlike actor_isolation_apply(), this is meant to be called by a handler --
+ * or by a helper the handler execs -- rather than by the runtime, because the
+ * moment it runs is the point of the whole thing. A handler that must keep one
+ * capability for itself while denying it to what it spawns opens that
+ * connection first, then calls this, then spawns: the descendant inherits the
+ * narrower domain and cannot reopen what the parent already holds.
+ *
+ * An already-open file descriptor survives -- Landlock governs the act of
+ * opening or connecting, not a connection that exists. That asymmetry is not
+ * an oversight to work around; it is the mechanism.
+ *
+ * Nothing here can widen anything. If the caller is already confined, the
+ * result is the intersection.
+ */
+int actor_isolation_restrict(void) {
+    return build_and_restrict(getenv("ACTOR_RESTRICT_RO"),
+                              getenv("ACTOR_RESTRICT_RW"),
+                              getenv("ACTOR_RESTRICT_NET_CONNECT"),
+                              "ACTOR_RESTRICT_RO", "ACTOR_RESTRICT_RW",
+                              "ACTOR_RESTRICT_NET_CONNECT", 0);
 }
 
 
