@@ -394,6 +394,16 @@ static const char *ll_exec_ro(void) {
 }
 
 /* Build "ACTOR_LANDLOCK_RO=<paths>" into a caller-supplied buffer. */
+/* Same as ll_ro_env, plus this repo's bin/ -- the confine tests exec
+   ./bin/actor-confine from the handler, and Landlock needs EXECUTE on it. The
+   base set covers the shell and the loader, not the tree under test. */
+static char *ll_ro_env_with_bin(char *buf, size_t cap) {
+    char cwd[256];
+    if (!getcwd(cwd, sizeof(cwd))) cwd[0] = 0;
+    snprintf(buf, cap, "ACTOR_LANDLOCK_RO=%.380s:%.100s/bin", ll_exec_ro(), cwd);
+    return buf;
+}
+
 static char *ll_ro_env(char *buf, size_t cap) {
     /* %.400s: the path list cannot outgrow the caller's buffer once the
        "ACTOR_LANDLOCK_RO=" prefix is accounted for. */
@@ -533,6 +543,127 @@ static void rm_test_cgroup(const char *path) {
 /* The actor joins the cgroup it was given, and says so. Membership is checked
    from the outside -- reading the cgroup's own cgroup.procs -- rather than
    trusting the actor's log line. */
+/* actor-confine: a descendant can be narrowed below the actor's own domain.
+ *
+ * This is the property the whole helper exists for. The actor is granted rw on
+ * a directory; the handler then execs actor-confine with a narrower rw set,
+ * and the program it runs must lose what the handler still has. If Landlock
+ * domains did not nest -- or if the second ruleset silently failed -- the
+ * write would succeed and this test would catch it.
+ *
+ * The handler is a script on disk rather than an inline `sh -c` string: the
+ * command has to survive the test's C literal, start_actor's own `sh -c`, and
+ * then quote a third command for actor-confine to run. A file has no quoting.
+ */
+static void t_confine_narrows_descendant(void) {
+    TEST("confine: a descendant is narrowed below the actor's own ruleset");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso40; mkdir -p /tmp/iso40/inner");
+    {
+        char cwd[256]; if (!getcwd(cwd, sizeof(cwd))) cwd[0] = 0;
+        char cmd[1024];
+        snprintf(cmd, sizeof(cmd),
+            "cat > /tmp/iso40/h.sh <<'EOS'\n"
+            "echo done\n"
+            "echo a > /tmp/iso40/parent.txt && echo PARENT_WROTE || echo PARENT_DENIED\n"
+            "export ACTOR_RESTRICT_RW=/tmp/iso40/inner:/dev\n"
+            "export ACTOR_RESTRICT_RO=$ACTOR_LANDLOCK_RO\n"
+            "%s/bin/actor-confine /bin/sh /tmp/iso40/inner/child.sh\n"
+            "EOS\n"
+            /* The child script lives INSIDE the directory the child is still
+               granted. Put it outside and the confined program cannot read
+               its own script -- the restriction working, but nothing this
+               test means to assert.
+               The `2>/dev/null` stays, and /dev is granted to match: a shell
+               redirect is a path open like any other, so a narrowed set that
+               omits /dev breaks every handler that writes one. That is the
+               likeliest way to misconfigure this, so the test writes what a
+               real handler writes rather than avoiding it. */
+            "cat > /tmp/iso40/inner/child.sh <<'EOS'\n"
+            "echo b > /tmp/iso40/child.txt 2>/dev/null && echo CHILD_WROTE || echo CHILD_DENIED\n"
+            "echo c > /tmp/iso40/inner/ok.txt 2>/dev/null && echo INNER_WROTE || echo INNER_DENIED\n"
+            "EOS\n"
+            "chmod +x /tmp/iso40/h.sh /tmp/iso40/inner/child.sh", cwd);
+        system(cmd);
+    }
+    char roenv[512]; ll_ro_env_with_bin(roenv, sizeof(roenv));
+    char *extra[] = { roenv, (char *)"ACTOR_LANDLOCK_RW=/tmp/iso40:/dev" };
+    pid_t ap = start_actor("sh /tmp/iso40/h.sh", "/tmp/iso40", extra, 2);
+    ms(900);
+    nng_socket s = sub_done();
+    sendm("work", "x");
+    char buf[512] = {0};
+    int got = drain(s, 3000, buf, sizeof(buf));
+    nng_close(s);
+    CHECK(got > 0, "no result");
+    if (got > 0) printf("  handler reported: %s\n", buf);
+    CHECK(strstr(buf, "PARENT_WROTE") != NULL,
+          "the handler itself lost access it was granted");
+    CHECK(strstr(buf, "CHILD_DENIED") != NULL,
+          "actor-confine did not narrow the descendant");
+    CHECK(strstr(buf, "CHILD_WROTE") == NULL,
+          "the confined program wrote outside its narrowed rw set");
+    /* Narrowed, not simply broken: what the inner set still grants must work. */
+    CHECK(strstr(buf, "INNER_WROTE") != NULL,
+          "the confined program lost even its own narrowed rw set");
+    stop(pp, ap);
+}
+
+/* Restricting only outbound TCP must not cost the filesystem.
+ *
+ * Handling an access right with no matching rule denies it entirely, which is
+ * the no-ambient-allow property the rest of this file depends on. It makes a
+ * net-only restriction a trap: handle the filesystem too and every path
+ * disappears. The guard is that the filesystem is handled only when a path
+ * list asks for it, and this is what says so.
+ *
+ * The probe reads a file inside the ACTOR's own rw set, not something like
+ * /etc/hostname -- the actor is already confined, so an unrelated path would
+ * fail for its ruleset's reasons and say nothing about this one.
+ */
+static void t_confine_net_only_keeps_fs(void) {
+    TEST("confine: a net-only restriction leaves the filesystem alone");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso41; mkdir -p /tmp/iso41; echo VISIBLE > /tmp/iso41/f.txt");
+    {
+        char cwd[256]; if (!getcwd(cwd, sizeof(cwd))) cwd[0] = 0;
+        char cmd[1024];
+        snprintf(cmd, sizeof(cmd),
+            "cat > /tmp/iso41/h.sh <<'EOS'\n"
+            "echo done\n"
+            "export ACTOR_RESTRICT_NET_CONNECT=8080\n"
+            "%s/bin/actor-confine /bin/sh /tmp/iso41/child.sh\n"
+            "EOS\n"
+            "cat > /tmp/iso41/child.sh <<'EOS'\n"
+            "grep -q VISIBLE /tmp/iso41/f.txt 2>/dev/null && echo FS_OK || echo FS_LOST\n"
+            "EOS\n"
+            "chmod +x /tmp/iso41/h.sh /tmp/iso41/child.sh", cwd);
+        system(cmd);
+    }
+    char roenv[512]; ll_ro_env_with_bin(roenv, sizeof(roenv));
+    char *extra[] = { roenv, (char *)"ACTOR_LANDLOCK_RW=/tmp/iso41:/dev" };
+    pid_t ap = start_actor("sh /tmp/iso41/h.sh", "/tmp/iso41", extra, 2);
+    ms(900);
+    nng_socket s = sub_done();
+    sendm("work", "x");
+    char buf[512] = {0};
+    int got = drain(s, 3000, buf, sizeof(buf));
+    nng_close(s);
+    CHECK(got > 0, "no result");
+    if (got > 0) printf("  handler reported: %s\n", buf);
+    /* ABI < 4 has no net support and actor-confine fails closed, so the probe
+       never runs. Correct behaviour, and nothing this property can say. */
+    if (strstr(buf, "FS_OK") == NULL && strstr(buf, "FS_LOST") == NULL) {
+        printf("  skipped: no landlock net support (ABI < 4)\n");
+    } else {
+        CHECK(strstr(buf, "FS_OK") != NULL,
+              "a net-only restriction denied the filesystem");
+    }
+    stop(pp, ap);
+}
+
 static void t_cgroup_join(void) {
     TEST("cgroup: actor joins the cgroup it is given");
     cleanup();
@@ -1293,6 +1424,8 @@ int main(void) {
     t_landlock_lmdb_outside_fails();
     t_landlock_missing_path_fails();
     t_landlock_bad_port_fails();
+    t_confine_narrows_descendant();
+    t_confine_net_only_keeps_fs();
     t_cgroup_join();
     t_cgroup_missing_fails();
     t_tuple_absent_unchanged();

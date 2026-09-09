@@ -40,7 +40,7 @@ endif
 
 .PHONY: all actor mesh-proxy clean test-concurrency test-isolation linux-arm64 macos-x64 macos-arm64 windows-x64
 
-all: actor mesh-proxy
+all: actor mesh-proxy actor-confine
 
 bin/:
 	mkdir -p bin
@@ -52,6 +52,10 @@ actor: runtime/main.c runtime/actor.c runtime/actor_isolation.c runtime/actor.h 
 mesh-proxy: proxy/proxy.c | bin/
 	$(CC) $(CFLAGS) $(LDFLAGS) proxy/proxy.c $(LIBS) -o bin/mesh-proxy
 
+# No $(LIBS): this links the isolation unit alone and never touches nng.
+actor-confine: tools/actor-confine.c runtime/actor_isolation.c runtime/actor_isolation.h | bin/
+	$(CC) $(CFLAGS) $(LDFLAGS) tools/actor-confine.c runtime/actor_isolation.c -o bin/actor-confine
+
 # Concurrency / child-reaping tests. Needs actor + mesh-proxy built first;
 # run from the repo root so ./bin/... resolves.
 test-concurrency: actor mesh-proxy tests/test-concurrency.c | bin/
@@ -60,7 +64,7 @@ test-concurrency: actor mesh-proxy tests/test-concurrency.c | bin/
 
 # Isolation tests. Needs actor + mesh-proxy built first; run from the repo
 # root so ./bin/... resolves.
-test-isolation: actor mesh-proxy tests/test-isolation.c | bin/
+test-isolation: actor mesh-proxy actor-confine tests/test-isolation.c | bin/
 	$(CC) $(CFLAGS) $(LDFLAGS) tests/test-isolation.c -lnng -o bin/test-isolation
 	./bin/test-isolation
 

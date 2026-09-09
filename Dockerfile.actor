@@ -9,6 +9,15 @@ RUN gcc -Wall -Wextra -Os -std=c11 \
     -lnng -llmdb -o /actor && \
     strip /actor
 
+# ── Confinement wrapper ─────────────────────────────────────────────
+# A handler that must keep a capability while denying it to what it spawns
+# opens the connection, execs this, then spawns. No nng or lmdb: it links the
+# isolation unit alone.
+COPY tools/actor-confine.c /src/tools/
+RUN gcc -Wall -Wextra -Os -std=c11 \
+    tools/actor-confine.c runtime/actor_isolation.c -o /actor-confine && \
+    strip /actor-confine
+
 # ── Echo handler ────────────────────────────────────────────────────
 COPY handlers/echo.c /src/handlers/
 RUN mkdir -p /handlers && \
@@ -18,6 +27,7 @@ RUN mkdir -p /handlers && \
 FROM alpine:3.24
 RUN apk add --no-cache nng lmdb
 COPY --from=builder /actor /actor
+COPY --from=builder /actor-confine /actor-confine
 COPY --from=builder /handlers/echo /handlers/echo
 EXPOSE 5556 5557
 ENTRYPOINT ["/actor"]

@@ -281,6 +281,10 @@ typedef struct {
     char caus_hex[33];
     char origin[32];
     char attempt[12];
+    /* 33, not 32: the header field is a null-PADDED 32-byte array, not a
+       null-terminated string, so a topic occupying all 32 bytes needs one
+       more byte to terminate. */
+    char topic[33];
 } child_env_t;
 
 /* platform_spawn launches the handler, pipes payload to its stdin,
@@ -298,6 +302,7 @@ static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
     SetEnvironmentVariableA("ACTOR_CAUSATION_ID",   env->caus_hex);
     SetEnvironmentVariableA("ACTOR_TUPLE_ORIGIN",   env->origin);
     SetEnvironmentVariableA("ACTOR_ATTEMPT",        env->attempt);
+    SetEnvironmentVariableA("ACTOR_TUPLE_TOPIC",    env->topic);
     HANDLE stdin_rd  = NULL, stdin_wr  = NULL;
     HANDLE stdout_rd = NULL, stdout_wr = NULL;
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
@@ -502,6 +507,11 @@ static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
         setenv("ACTOR_CAUSATION_ID",   env->caus_hex, 1);
         setenv("ACTOR_TUPLE_ORIGIN",   env->origin,   1);
         setenv("ACTOR_ATTEMPT",        env->attempt,  1);
+        /* Which subscription delivered this tuple. ACTOR_TOPIC may name
+           several, and without this a handler serving more than one cannot
+           tell them apart -- so a single actor could subscribe widely but not
+           dispatch, and callers ran one actor per topic instead. */
+        setenv("ACTOR_TUPLE_TOPIC",    env->topic,    1);
 
         /* Per-tuple namespaces, before exec so they live and die with this one
            tuple. A failure here must not become a handler that runs anyway:
@@ -572,6 +582,7 @@ static ssize_t invoke_handler(const actor_header_t* hdr,
     actor_uuid_hex(hdr->causation_id,   env.caus_hex);
     snprintf(env.origin,  sizeof(env.origin),  "%.*s", 31, hdr->origin);
     snprintf(env.attempt, sizeof(env.attempt), "%d", hdr->attempt);
+    snprintf(env.topic,   sizeof(env.topic),   "%.*s", 32, hdr->topic);
 
     return platform_spawn(payload, payload_len, g_result_buf, ACTOR_MAX_PAYLOAD, &env);
 }
