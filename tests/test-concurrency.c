@@ -118,19 +118,38 @@ static pid_t start_proxy(void) {
  * runtime as a TOPIC OVERRIDE (see result_topic), so `echo ok` publishes to
  * topic "ok" and never to ACTOR_RESULT_TOPIC. Handlers here emit ":ok" so the
  * leading ':' disables that and results land where the test subscribes. */
-static pid_t start_actor(const char *handler, const char *conc, const char *retry, const char *dir) {
+/* spawn_actor keeps whatever LMDB `dir` already holds; start_actor empties it. */
+static pid_t spawn_actor(const char *handler, const char *conc, const char *retry, const char *dir) {
     static char h[512], c[64], r[64], d[256];
     snprintf(h, sizeof h, "ACTOR_HANDLER=%s", handler);
     snprintf(c, sizeof c, "ACTOR_CONCURRENCY=%s", conc);
     snprintf(r, sizeof r, "ACTOR_RETRY_MAX=%s", retry);
     snprintf(d, sizeof d, "ACTOR_LMDB_PATH=%s", dir);
-    char cmd[512]; snprintf(cmd, sizeof cmd, "rm -rf %s; mkdir -p %s", dir, dir);
-    system(cmd);
     char *a[] = { "./bin/actor", NULL };
     char *e[] = { "ACTOR_BUS_SUB=" SP, "ACTOR_BUS_PUB=" PP, "ACTOR_HEARTBEAT_MS=0",
                   "ACTOR_ID=tc", "ACTOR_TOPIC=work", "ACTOR_RESULT_TOPIC=done",
                   h, c, r, d, NULL };
     pid_t p = sp_(a, e); ms(700); return p;
+}
+
+static pid_t start_actor(const char *handler, const char *conc, const char *retry, const char *dir) {
+    char cmd[512]; snprintf(cmd, sizeof cmd, "rm -rf %s; mkdir -p %s", dir, dir);
+    system(cmd);
+    return spawn_actor(handler, conc, retry, dir);
+}
+
+static int wait_exit(pid_t p, int budget) {
+    for (int64_t end = now_ms() + budget; now_ms() < end; ms(50))
+        if (waitpid(p, NULL, WNOHANG) == p) return 1;
+    return 0;
+}
+
+/* Read a small log, newlines turned into spaces for one-line output. */
+static void slurp(const char *path, char *buf, size_t cap) {
+    buf[0] = 0;
+    FILE *f = fopen(path, "r");
+    if (f) { buf[fread(buf, 1, cap - 1, f)] = 0; fclose(f); }
+    for (char *c = buf; *c; c++) if (*c == '\n') *c = ' ';
 }
 
 static void stop(pid_t proxy, pid_t actor) {
@@ -325,16 +344,62 @@ static void t_retry_attempts_and_backoff(void) {
     int64_t elapsed = now_ms() - t0;
     nng_close(rej);
     stop(pp, ap);
-    char log[64] = {0};
-    FILE *f = fopen("/tmp/tc_retry_log", "r");
-    if (f) { log[fread(log, 1, sizeof log - 1, f)] = 0; fclose(f); }
-    int ok = strcmp(log, "0\n1\n2\n3\n4\n5\n") == 0;
-    for (char *c = log; *c; c++) if (*c == '\n') *c = ' ';
+    char log[64]; slurp("/tmp/tc_retry_log", log, sizeof log);
     printf("  rejected=%d elapsed=%lldms attempts=[%s]\n", rejected, (long long)elapsed, log);
     CHECK(rejected == 1, "exhausted retries were not rejected");
-    CHECK(ok, "ACTOR_ATTEMPT did not count the retries");
+    CHECK(strcmp(log, "0 1 2 3 4 5 ") == 0, "ACTOR_ATTEMPT did not count the retries");
     /* 100+200+400+800+1600ms: the fifth backoff is the one that used to vanish */
     CHECK(elapsed >= 3100, "backoff was skipped");
+}
+
+/* ── 6. Durability ────────────────────────────────────────────────────────── */
+
+static void t_replay_after_crash(void) {
+    TEST("a tuple in flight when the actor dies is replayed on restart as attempt 1");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -f /tmp/tc_rp_log");
+    const char *h = "sh -c 'echo $ACTOR_ATTEMPT >> /tmp/tc_rp_log; sleep 1; echo :ok'";
+    pid_t ap = start_actor(h, "1", "0", "/tmp/tc_rp");
+    sendm("work", "x", 0, 0);
+    ms(400);
+    kill(ap, SIGKILL); waitpid(ap, NULL, 0);
+    nng_socket done = sub_open("done");
+    ap = spawn_actor(h, "1", "0", "/tmp/tc_rp");
+    int n = drain_n(done, 4000, 1, NULL, 0);
+    nng_close(done);
+    stop(pp, ap);
+    char log[64]; slurp("/tmp/tc_rp_log", log, sizeof log);
+    printf("  results=%d attempts=[%s]\n", n, log);
+    CHECK(n == 1, "the interrupted tuple was not replayed");
+    CHECK(strcmp(log, "0 1 ") == 0, "the replay did not arrive as attempt 1");
+}
+
+static void t_stop_leaves_unfinished(void) {
+    TEST("SIGTERM lets a handler finish, does not retry it, and the next run does");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -f /tmp/tc_st_log");
+    pid_t ap = start_actor("sh -c 'echo $ACTOR_ATTEMPT >> /tmp/tc_st_log; sleep 1; exit 1'",
+                           "1", "3", "/tmp/tc_st");
+    nng_socket rej = sub_open("tuple_rejected");
+    sendm("work", "x", 0, 0);
+    ms(400);
+    kill(ap, SIGTERM);
+    int exited = wait_exit(ap, 5000);
+    int rejected = drain(rej, 300, NULL, 0);
+    nng_close(rej);
+    nng_socket done = sub_open("done");
+    ap = spawn_actor("sh -c 'echo $ACTOR_ATTEMPT >> /tmp/tc_st_log; echo :ok'",
+                     "1", "3", "/tmp/tc_st");
+    int n = drain_n(done, 3000, 1, NULL, 0);
+    nng_close(done);
+    stop(pp, ap);
+    char log[64]; slurp("/tmp/tc_st_log", log, sizeof log);
+    printf("  exited=%d rejected=%d results=%d attempts=[%s]\n", exited, rejected, n, log);
+    CHECK(exited, "the actor did not exit once its handler finished");
+    CHECK(rejected == 0, "a failure during shutdown was retried into a rejection");
+    CHECK(n == 1 && strcmp(log, "0 1 ") == 0, "the unfinished tuple was not replayed");
 }
 
 int main(void) {
@@ -348,6 +413,8 @@ int main(void) {
     t_ttl_expired_not_run();
     t_live_ttl_still_runs();
     t_retry_attempts_and_backoff();
+    t_replay_after_crash();
+    t_stop_leaves_unfinished();
     cleanup();
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED",
            failures, failures == 1 ? "" : "s");

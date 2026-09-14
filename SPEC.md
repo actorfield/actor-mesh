@@ -200,7 +200,7 @@ payload(h : actor_header_t*) : uint8*  ≙  (uint8*)(h + 1)
 ├─────────────────────────────────────────────────────────────────────┤
 │ dom(inbox) ∩ dom(outbox) = ∅                                        │
 │ ∀ k ∈ dom(inbox) : k is the id of a tuple currently being processed │
-│ |inbox| ≤ 1 at any time (single-threaded actor)                     │
+│ |inbox| ≤ ACTOR_MAX_CONCURRENCY  (one per busy worker)              │
 │ Environment size ≤ 64 MiB                                            │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -212,12 +212,14 @@ Before processing  →  lmdb_put(inbox,  t.id, wire(t, p))
 After success       →  lmdb_del(inbox,  t.id)
                       [outbox was put and deleted within publish_result]
 After max retries   →  lmdb_del(inbox,  t.id)
+While stopping      →  no retry; a failed tuple stays in inbox
 
 On restart:
-  — inbox entries with pending NNG messages are re-received via normal poll
-  — no explicit inbox walk at startup (NNG replay covers it)
-  — outbox entries from crash-mid-publish are not replayed
-    (current implementation deletes outbox immediately after send)
+  — outbox is cleared; replaying the inbox supersedes it
+  — each inbox entry is processed again before new messages,
+    with attempt + 1, by the configured workers
+  — an entry past its TTL is rejected (ttl_expired) and deleted
+  — delivery is therefore at-least-once
 ```
 
 ---
@@ -682,7 +684,7 @@ predicate TopicMatch(msg_topic : Topic, sub_topic : Topic) ≙
 ```
 ┌─ Durability Invariants ─────────────────────────────────────────────┐
 │ DI1: At most one tuple in processing at any time                    │
-│      |inbox| ≤ 1  (single-threaded actor)                           │
+│      |inbox| ≤ ACTOR_MAX_CONCURRENCY  (one per busy worker)         │
 │                                                                     │
 │ DI2: inbox and outbox are disjoint                                  │
 │      dom(inbox) ∩ dom(outbox) = ∅                                   │

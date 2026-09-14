@@ -110,7 +110,7 @@ Header env vars available to every handler:
 | `ACTOR_CORRELATION_ID` | hex correlation id (same across chain) |
 | `ACTOR_CAUSATION_ID` | hex id of direct parent tuple |
 | `ACTOR_TUPLE_ORIGIN` | origin actor id |
-| `ACTOR_ATTEMPT` | retry count |
+| `ACTOR_ATTEMPT` | retries and replays so far, 0 = first run |
 
 ---
 
@@ -173,7 +173,8 @@ int main(void) {
    k. Write result frame to LMDB outbox
    l. Publish result to NNG bus
    m. Clear LMDB inbox + outbox
-6. On SIGTERM — drain and exit
+6. On SIGTERM — stop receiving, let running handlers finish, exit.
+   One that fails is not retried; it stays in the inbox for the next run.
 ```
 
 ---
@@ -188,8 +189,10 @@ outbox/  {uuidv7} → raw frame    written before publish, cleared after publish
 state/   {key}    → bytes        handler-managed state (e.g. conversation history)
 ```
 
-On restart — pending inbox tuples are reprocessed.
-Pending outbox tuples are republished.
+On restart, every tuple left in the inbox is processed again before new
+messages, with `ACTOR_ATTEMPT` one higher so the handler can tell. The
+inbox entry is cleared only after the result is published, so this also
+covers a crash mid-publish: delivery is at-least-once.
 No central coordinator needed.
 
 Handlers can use the same LMDB (via `ACTOR_LMDB_PATH`) to persist state

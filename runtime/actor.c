@@ -23,6 +23,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <errno.h>
 #include <time.h>
 #include <sys/wait.h>
@@ -159,6 +160,11 @@ static MDB_dbi    dbi_state;
 
 static volatile sig_atomic_t g_stop = 0;
 
+/* Inbox entries left by the previous run, replayed before new messages. */
+static uint8_t    g_replay[ACTOR_MAX_CONCURRENCY][16];
+static int        g_replay_n;
+static atomic_int g_replay_next;
+
 /* ── Signal ──────────────────────────────────────────────────────────────── */
 
 static void on_signal(int s) { (void)s; g_stop = 1; }
@@ -237,6 +243,20 @@ static int lmdb_setup(void) {
     mdb_dbi_open(txn, "inbox",  MDB_CREATE, &dbi_inbox);
     mdb_dbi_open(txn, "outbox", MDB_CREATE, &dbi_outbox);
     mdb_dbi_open(txn, "state",  MDB_CREATE, &dbi_state);
+
+    /* The inbox holds what the last run had in flight -- at most one tuple
+       per worker. Replaying it covers any outbox copy, so drop those. */
+    mdb_drop(txn, dbi_outbox, 0);
+    MDB_cursor*   cur;
+    MDB_val       k, v;
+    MDB_cursor_op op = MDB_FIRST;
+    if (mdb_cursor_open(txn, dbi_inbox, &cur) == 0) {
+        while (g_replay_n < ACTOR_MAX_CONCURRENCY && mdb_cursor_get(cur, &k, &v, op) == 0) {
+            op = MDB_NEXT;
+            if (k.mv_size == 16) memcpy(g_replay[g_replay_n++], k.mv_data, 16);
+        }
+        mdb_cursor_close(cur);
+    }
     mdb_txn_commit(txn);
     return 0;
 }
@@ -404,11 +424,12 @@ typedef struct {
 static child_slot_t   g_children[ACTOR_MAX_CONCURRENCY];
 static pthread_mutex_t child_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  child_cv = PTHREAD_COND_INITIALIZER;
+static atomic_int      g_reaper_stop;   /* set once every worker has returned */
 
 /* Reaper thread: the only caller of waitpid in the process. */
 static void* reaper_main(void* arg) {
     (void)arg;
-    while (!g_stop) {
+    while (!atomic_load(&g_reaper_stop)) {
         int   status;
         pid_t pid = waitpid(-1, &status, WNOHANG);
         if (pid <= 0) {
@@ -439,23 +460,9 @@ static void* reaper_main(void* arg) {
    Returns the raw waitpid status. */
 static int await_child(int slot) {
     pthread_mutex_lock(&child_mu);
-    while (!g_children[slot].done) {
-        /* Timed wait so shutdown cannot leave a worker parked forever if the
-           reaper has already stopped. */
-        struct timespec until;
-        clock_gettime(CLOCK_REALTIME, &until);
-        until.tv_nsec += 50 * 1000 * 1000;
-        if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
-        pthread_cond_timedwait(&child_cv, &child_mu, &until);
-        if (g_stop && !g_children[slot].done) {
-            /* Treat an interrupted wait as a failed run: retry/rejection is
-               the safe reading, never "succeeded". */
-            g_children[slot].pid = 0;
-            g_children[slot].done = 0;
-            pthread_mutex_unlock(&child_mu);
-            return -1;
-        }
-    }
+    /* The reaper outlives every worker, so this always gets an answer. */
+    while (!g_children[slot].done)
+        pthread_cond_wait(&child_cv, &child_mu);
     int status = g_children[slot].status;
     g_children[slot].pid  = 0;
     g_children[slot].done = 0;
@@ -560,7 +567,6 @@ static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
     close(from_child[0]);
 
     int status = await_child(slot);
-    if (status == -1) return -1;                        /* interrupted */
     if (WIFEXITED(status) && WEXITSTATUS(status) != 0) return -1;
     if (!WIFEXITED(status)) return -1;                  /* signalled — not a success */
 
@@ -740,6 +746,9 @@ static void process_tuple(const actor_header_t* hdr,
             break;
         }
 
+        /* Stopping: leave it in the inbox for the next run to replay. */
+        if (g_stop) return;
+
         attempt++;
         if (attempt > cfg.retry_max) {
             publish_rejection(hdr, "max_retries_exceeded");
@@ -784,18 +793,41 @@ static void process_tuple(const actor_header_t* hdr,
  *
  */
 
+/* Load the next unclaimed replay into *msg, as attempt + 1. */
+static int replay_next(nng_msg** msg) {
+    if (atomic_load(&g_replay_next) >= g_replay_n) return 0;
+    int i = atomic_fetch_add(&g_replay_next, 1);
+    if (i >= g_replay_n) return 0;
+
+    MDB_txn* txn;
+    MDB_val  k = { 16, g_replay[i] }, v;
+    int      ok = 0;
+    if (mdb_txn_begin(mdb_env, NULL, MDB_RDONLY, &txn) != 0) return 0;
+    if (mdb_get(txn, dbi_inbox, &k, &v) == 0 && v.mv_size >= sizeof(actor_header_t) &&
+        nng_msg_alloc(msg, 0) == 0) {
+        nng_msg_append(*msg, v.mv_data, v.mv_size);
+        ((actor_header_t*)nng_msg_body(*msg))->attempt++;
+        ok = 1;
+    }
+    mdb_txn_abort(txn);
+    return ok;
+}
+
 /* One turn of the receive loop, shared by every worker. Returns 0 to keep
    going, -1 to stop. Split out of actor_run so extra workers can run the
    identical cycle -- the only thing that must NOT be duplicated per worker is
    the heartbeat, which stays in actor_run. */
 static int serve_once(void) {
     nng_msg* msg = NULL;
-    int rc = nng_recvmsg(nng_sub, &msg, 0);
-    if (rc == NNG_ETIMEDOUT) return 0;
-    if (rc != 0) {
-        if (g_stop) return -1;
-        fprintf(stderr, "[actor] recv error: %s\n", nng_strerror(rc));
-        return -1;
+    int replayed = replay_next(&msg);
+    if (!replayed) {
+        int rc = nng_recvmsg(nng_sub, &msg, 0);
+        if (rc == NNG_ETIMEDOUT) return 0;
+        if (rc != 0) {
+            if (g_stop) return -1;
+            fprintf(stderr, "[actor] recv error: %s\n", nng_strerror(rc));
+            return -1;
+        }
     }
 
     void*  body     = nng_msg_body(msg);
@@ -817,6 +849,7 @@ static int serve_once(void) {
        rather than forked. */
     if (actor_tuple_expired(hdr)) {
         publish_rejection(hdr, "ttl_expired");
+        if (replayed) lmdb_del(dbi_inbox, hdr->id, 16);
         nng_msg_free(msg);
         return 0;
     }
@@ -861,6 +894,7 @@ int actor_run(void) {
 
     fprintf(stderr, "[actor] id=%s topic(s)=%s handler=%s max_payload=%d concurrency=%d\n",
             cfg.id, cfg.topic, cfg.handler, ACTOR_MAX_PAYLOAD, cfg.concurrency);
+    if (g_replay_n) fprintf(stderr, "[actor] replaying %d tuple(s) from the inbox\n", g_replay_n);
 
     int64_t last_hb = 0;
 
@@ -908,6 +942,7 @@ int actor_run(void) {
 #ifndef _WIN32
     g_stop = 1;
     for (int i = 0; i < nworkers; i++) pthread_join(workers[i], NULL);
+    atomic_store(&g_reaper_stop, 1);
     pthread_join(reaper, NULL);
 #endif
     nng_close(nng_pub);
