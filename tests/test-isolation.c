@@ -307,6 +307,16 @@ static void t_failing_handler_still_fails(void) {
     stop(pp, ap);
 }
 
+/* Root here is the root RLIMIT_NPROC exempts: uid 0 of the initial user
+   namespace, not of a rootless container. */
+static int init_userns(void) {
+    FILE *f = fopen("/proc/self/uid_map", "r");
+    unsigned in = 1, out = 1, count = 0;
+    int got = f ? fscanf(f, "%u %u %u", &in, &out, &count) : 0;
+    if (f) fclose(f);
+    return got == 3 && in == 0 && out == 0 && count == 4294967295u;
+}
+
 /* RLIMIT_NPROC is the one limit whose correct value depends on what else the
    REAL uid is already running: the kernel counts every process and thread for
    that uid system wide, not just this actor's. On a machine where the uid also
@@ -321,6 +331,10 @@ static void t_failing_handler_still_fails(void) {
 static void t_nproc_ordering(void) {
     TEST("ACTOR_RLIMIT_NPROC above current usage: actor still serves tuples");
     cleanup();
+    if (geteuid() == 0 && init_userns()) {
+        printf("  SKIP: root is exempt from RLIMIT_NPROC (see the fails-closed case)\n");
+        return;
+    }
 
     /* Current processes+threads for this uid, plus generous headroom. */
     int cur = 0;
@@ -369,6 +383,30 @@ static void t_nproc_below_usage_fails(void) {
     nng_close(s);
     CHECK(got == 0, "actor served a tuple despite an NPROC limit it cannot satisfy");
     stop(pp, ap);
+}
+
+/* Root is exempt from RLIMIT_NPROC, so a limit set with no ACTOR_UID to drop
+   to would do nothing. The actor must refuse to start, not run believing it
+   is limited. */
+static void t_nproc_exempt_fails_closed(void) {
+    TEST("ACTOR_RLIMIT_NPROC as root, with no ACTOR_UID, fails closed");
+    cleanup();
+    if (geteuid() != 0 || !init_userns()) {
+        printf("  SKIP: needs root in the initial user namespace, the case the kernel exempts\n");
+        return;
+    }
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso8b; mkdir -p /tmp/iso8b");
+    char *extra[] = { (char *)"ACTOR_RLIMIT_NPROC=100000" };
+    pid_t ap = start_actor("sh -c 'echo done; echo ok'", "/tmp/iso8b", extra, 1);
+    int gone = exited(ap);
+    nng_socket s = sub_done();
+    sendm("work", "x");
+    int got = drain(s, 1200, NULL, 0);
+    nng_close(s);
+    CHECK(gone, "actor started with an NPROC limit the kernel will not enforce");
+    CHECK(got == 0, "actor served a tuple under an NPROC limit that does nothing");
+    stop(pp, gone ? -1 : ap);
 }
 
 
@@ -1467,6 +1505,7 @@ int main(void) {
     t_failing_handler_still_fails();
     t_nproc_ordering();
     t_nproc_below_usage_fails();
+    t_nproc_exempt_fails_closed();
     t_landlock_allows_handler();
     t_landlock_denies_outside();
     t_landlock_lmdb_outside_fails();

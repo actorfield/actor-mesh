@@ -286,7 +286,9 @@ worst available reading of a typo.
   system-wide** — not the actor's descendants. Give an actor its own uid and
   size the limit against `ps -L -u <uid> | wc -l`, or a value that looks
   generous can already be below current usage and the actor dies on its first
-  `pthread_create`.
+  `pthread_create`. Root in the initial user namespace, and any process holding
+  `CAP_SYS_ADMIN` or `CAP_SYS_RESOURCE`, is exempt from it, so setting it there
+  without an `ACTOR_UID` to drop to fails startup.
 - **Namespaces need privilege.** Unprivileged `unshare(CLONE_NEWPID)` is EPERM
   on a stock host; the runtime retries behind a user namespace, which works
   where unprivileged user namespaces are enabled. `ACTOR_TUPLE_USERNS=0` opts
