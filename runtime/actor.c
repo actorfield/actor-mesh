@@ -334,6 +334,7 @@ typedef struct {
        null-terminated string, so a topic occupying all 32 bytes needs one
        more byte to terminate. */
     char topic[33];
+    char deadline[21];   /* emitted_at + ttl, unix ns; "0" = none */
 } child_env_t;
 
 /* How one handler run ended. */
@@ -364,6 +365,7 @@ static run_status_t platform_spawn(const uint8_t* in,  size_t in_len,
     SetEnvironmentVariableA("ACTOR_TUPLE_ORIGIN",   env->origin);
     SetEnvironmentVariableA("ACTOR_ATTEMPT",        env->attempt);
     SetEnvironmentVariableA("ACTOR_TUPLE_TOPIC",    env->topic);
+    SetEnvironmentVariableA("ACTOR_TUPLE_DEADLINE", env->deadline);
     HANDLE stdin_rd  = NULL, stdin_wr  = NULL;
     HANDLE stdout_rd = NULL, stdout_wr = NULL;
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
@@ -660,6 +662,7 @@ static run_status_t platform_spawn(const uint8_t* in,  size_t in_len,
            tell them apart -- so a single actor could subscribe widely but not
            dispatch, and callers ran one actor per topic instead. */
         setenv("ACTOR_TUPLE_TOPIC",    env->topic,    1);
+        setenv("ACTOR_TUPLE_DEADLINE", env->deadline, 1);
 
         /* Per-tuple namespaces, before exec so they live and die with this one
            tuple. A failure here must not become a handler that runs anyway:
@@ -739,6 +742,8 @@ static run_status_t invoke_handler(const actor_header_t* hdr,
     snprintf(env.origin,  sizeof(env.origin),  "%.*s", 31, hdr->origin);
     snprintf(env.attempt, sizeof(env.attempt), "%d", attempt);
     snprintf(env.topic,   sizeof(env.topic),   "%.*s", 32, hdr->topic);
+    int64_t deadline = hdr->ttl ? hdr->emitted_at + hdr->ttl : 0;
+    snprintf(env.deadline, sizeof(env.deadline), "%lld", (long long)deadline);
 
     return platform_spawn(payload, payload_len, g_result_buf, ACTOR_MAX_PAYLOAD, &env,
                           hdr, result_len);
@@ -957,6 +962,10 @@ static void process_tuple(const actor_header_t* hdr,
         int64_t ns = 100000000LL << (attempt < 20 ? attempt - 1 : 19);
         struct timespec backoff = { ns / 1000000000LL, ns % 1000000000LL };
         nanosleep(&backoff, NULL);
+        if (actor_tuple_expired(hdr)) {   /* the caller gave up while we waited */
+            publish_rejection(hdr, REJECT_TTL_EXPIRED);
+            break;
+        }
         fprintf(stderr, "[actor] retry %d/%d\n", attempt, cfg.retry_max);
     }
 

@@ -254,7 +254,9 @@ setenv("ACTOR_TUPLE_ID",       hex(t.id),             1)
 setenv("ACTOR_CORRELATION_ID", hex(t.correlation_id), 1)
 setenv("ACTOR_CAUSATION_ID",   hex(t.causation_id),   1)
 setenv("ACTOR_TUPLE_ORIGIN",   t.origin,              1)
-setenv("ACTOR_ATTEMPT",        str(t.attempt),        1)
+setenv("ACTOR_ATTEMPT",        str(attempt),          1)  — retries and replays
+setenv("ACTOR_TUPLE_TOPIC",    t.topic,               1)
+setenv("ACTOR_TUPLE_DEADLINE", str(t.ttl ≠ 0 ? t.emitted_at + t.ttl : 0), 1)
 ```
 
 ### 6.3 Topic Routing by Handler
@@ -409,6 +411,9 @@ procedure ProcessTuple(hdr : actor_header_t*, payload : uint8*,
       break
 
     nanosleep(backoff(attempt))
+    if Expired(hdr):
+      PublishRejection(hdr, "ttl_expired")
+      break  — the caller gave up while we waited
     log("retry %d/%d", attempt, cfg.retry_max)
 
   LmdbDel(dbi_inbox, hdr.id, 16)

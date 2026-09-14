@@ -111,6 +111,8 @@ Header env vars available to every handler:
 | `ACTOR_CAUSATION_ID` | hex id of direct parent tuple |
 | `ACTOR_TUPLE_ORIGIN` | origin actor id |
 | `ACTOR_ATTEMPT` | retries and replays so far, 0 = first run |
+| `ACTOR_TUPLE_TOPIC` | topic that delivered the tuple |
+| `ACTOR_TUPLE_DEADLINE` | `emitted_at + ttl` in unix ns; `0` = no deadline |
 
 ---
 
@@ -407,6 +409,12 @@ max retry  →  drop tuple, log error
 
 Controlled by `ACTOR_RETRY_MAX` (default 3).
 Payload cap exceeded → drop immediately, no retry.
+
+TTL is a deadline for starting work, not for finishing it. It is checked
+before the handler runs and again before each retry, so a tuple whose caller
+has given up is rejected as `ttl_expired` rather than run again. A running
+handler is not stopped at it; it can read the deadline from
+`ACTOR_TUPLE_DEADLINE` and budget its own work.
 
 ---
 

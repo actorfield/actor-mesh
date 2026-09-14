@@ -562,6 +562,50 @@ static void t_heartbeat_lists_running(void) {
     CHECK(strstr(idle, "\"running\":[]") != NULL, "the heartbeat still listed a finished tuple");
 }
 
+/* ── 10. Deadline ─────────────────────────────────────────────────────────── */
+
+static void t_deadline_stops_retries(void) {
+    TEST("a tuple whose TTL passes between retries is not run again");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -f /tmp/tc_dl_log");
+    pid_t ap = start_actor("sh -c 'echo $ACTOR_ATTEMPT >> /tmp/tc_dl_log; exit 1'",
+                           "1", "5", "/tmp/tc_dl");
+    nng_socket rej = sub_open("tuple_rejected");
+    /* backoff wakes at ~0.1s, ~0.3s, ~0.7s: a 600ms TTL runs out before the third retry */
+    sendm("work", "x", 600000000LL, 0);
+    char reason[512] = {0};
+    int rejected = drain_n(rej, 5000, 1, reason, sizeof reason);
+    nng_close(rej);
+    stop(pp, ap);
+    char log[64]; slurp("/tmp/tc_dl_log", log, sizeof log);
+    printf("  rejected=%d attempts=[%s] %.100s\n", rejected, log, reason);
+    CHECK(rejected == 1 && strstr(reason, "\"reason\":\"ttl_expired\"") != NULL,
+          "not rejected as expired");
+    CHECK(strcmp(log, "0 1 2 ") == 0, "retried past the deadline");
+}
+
+static void t_deadline_reaches_handler(void) {
+    TEST("the handler sees its tuple's deadline in ACTOR_TUPLE_DEADLINE");
+    cleanup();
+    pid_t pp = start_proxy();
+    pid_t ap = start_actor("sh -c 'echo :$ACTOR_TUPLE_DEADLINE'", "1", "0", "/tmp/tc_dl2");
+    nng_socket done = sub_open("done");
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    int64_t emitted = ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    char with_ttl[128] = {0}, without[128] = {0};
+    sendm("work", "x", 60000000000LL, emitted);
+    drain_n(done, 3000, 1, with_ttl, sizeof with_ttl);
+    sendm("work", "y", 0, 0);
+    drain_n(done, 3000, 1, without, sizeof without);
+    nng_close(done);
+    stop(pp, ap);
+    printf("  with ttl: %.40s  without: %.40s\n", with_ttl, without);
+    CHECK(with_ttl[0] == ':' && atoll(with_ttl + 1) == emitted + 60000000000LL,
+          "ACTOR_TUPLE_DEADLINE is not emitted_at + ttl");
+    CHECK(strcmp(without, ":0\n") == 0, "a tuple without a TTL should have deadline 0");
+}
+
 int main(void) {
     printf("actor concurrency tests\n\n");
     t_parallel();
@@ -580,6 +624,8 @@ int main(void) {
     t_term_escalates_to_kill();
     t_term_names_its_target();
     t_heartbeat_lists_running();
+    t_deadline_stops_retries();
+    t_deadline_reaches_handler();
     cleanup();
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED",
            failures, failures == 1 ? "" : "s");
