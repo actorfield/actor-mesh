@@ -374,16 +374,24 @@ ACTOR_SECCOMP=permissive_mount \
 
 ## Heartbeat
 
-Every actor emits a heartbeat tuple periodically:
+Every actor emits a heartbeat tuple periodically, listing what it is running:
 
 ```json
-{"id": "sqlite-tool-1", "inbox": 0, "outbox": 0}
+{"id": "sqlite-tool-1", "inbox": 1, "outbox": 0,
+ "running": [{"tuple": "0190…", "correlation": "0190…", "topic": "sql_query",
+              "pid": 4312, "age_ms": 850, "terminating": false}]}
 ```
 
 Topic: `heartbeat`
 TTL: 3 × heartbeat interval
 
-Any actor subscribed to `heartbeat` can observe the mesh state.
+Any actor subscribed to `heartbeat` can observe the mesh state. `running` is
+the actor's process table: `pid` leads the handler's process group, and
+`correlation` is what a `_term` names to stop it. It is empty on Windows.
+
+The thread that reaps handlers sends it, so a long-running handler never
+silences it — at `ACTOR_CONCURRENCY=1` the only worker is busy for exactly as
+long as the heartbeat matters most.
 
 ---
 

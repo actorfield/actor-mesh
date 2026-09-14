@@ -178,6 +178,12 @@ static atomic_int g_replay_next;
    is already in the inbox. */
 typedef enum { TUPLE_RECEIVED, TUPLE_REPLAYED } tuple_source_t;
 
+static int64_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
 /* ── Signal ──────────────────────────────────────────────────────────────── */
 
 static void on_signal(int s) { (void)s; g_stop = 1; }
@@ -343,6 +349,8 @@ typedef enum {
  * Unix: fork/exec   Windows: CreateProcess */
 #ifdef _WIN32
 
+static void running_json(char* out, size_t cap) { snprintf(out, cap, "[]"); }
+
 static run_status_t platform_spawn(const uint8_t* in,  size_t in_len,
                                    uint8_t*       out, size_t out_cap,
                                    const child_env_t* env, const actor_header_t* hdr,
@@ -456,6 +464,8 @@ typedef struct {
     int     done;                /* set by the reaper                     */
     uint8_t tuple_id[16];        /* what it is running, for _term         */
     uint8_t correlation_id[16];
+    char    topic[33];
+    int64_t started_ms;          /* monotonic, for the heartbeat          */
     bool    terminated;          /* _term has sent SIGTERM                */
     int64_t kill_at_ms;          /* SIGKILL deadline, 0 = none            */
 } child_slot_t;
@@ -465,11 +475,7 @@ static pthread_mutex_t child_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  child_cv = PTHREAD_COND_INITIALIZER;
 static atomic_int      g_reaper_stop;   /* set once every worker has returned */
 
-static int64_t mono_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
-}
+static void heartbeat_tick(void);
 
 static bool id_is_zero(const uint8_t id[16]) {
     for (int i = 0; i < 16; i++) if (id[i]) return false;
@@ -519,12 +525,39 @@ static void escalate_kills(void) {
     pthread_mutex_unlock(&child_mu);
 }
 
+/* The running handlers, as the heartbeat's JSON array. Stops at a whole
+   entry if cap is reached, so the array is always valid. */
+static void running_json(char* out, size_t cap) {
+    size_t  n   = 0;
+    int64_t now = mono_ms();
+    out[n++] = '[';
+    pthread_mutex_lock(&child_mu);
+    for (int i = 0; i < ACTOR_MAX_CONCURRENCY; i++) {
+        const child_slot_t* c = &g_children[i];
+        if (!c->pid || c->done) continue;
+        char tid[33], cid[33];
+        actor_uuid_hex(c->tuple_id,       tid);
+        actor_uuid_hex(c->correlation_id, cid);
+        int w = snprintf(out + n, cap - n,
+                         "%s{\"tuple\":\"%s\",\"correlation\":\"%s\",\"topic\":\"%s\","
+                         "\"pid\":%d,\"age_ms\":%lld,\"terminating\":%s}",
+                         n > 1 ? "," : "", tid, cid, c->topic, (int)c->pid,
+                         (long long)(now - c->started_ms), c->terminated ? "true" : "false");
+        if (w < 0 || (size_t)w >= cap - n - 1) break;   /* keep room for ']' */
+        n += (size_t)w;
+    }
+    pthread_mutex_unlock(&child_mu);
+    out[n++] = ']';
+    out[n]   = '\0';
+}
+
 /* Reaper thread: the only caller of waitpid in the process. */
 static void* reaper_main(void* arg) {
     (void)arg;
     while (!atomic_load(&g_reaper_stop)) {
         control_poll();
         escalate_kills();
+        heartbeat_tick();
         int   status;
         pid_t pid = waitpid(-1, &status, WNOHANG);
         if (pid <= 0) {
@@ -649,6 +682,8 @@ static run_status_t platform_spawn(const uint8_t* in,  size_t in_len,
     c->status = 0;
     memcpy(c->tuple_id,       hdr->id,             16);
     memcpy(c->correlation_id, hdr->correlation_id, 16);
+    snprintf(c->topic, sizeof(c->topic), "%.*s", 32, hdr->topic);
+    c->started_ms = mono_ms();
     pthread_mutex_unlock(&child_mu);
 
     close(to_child[0]);
@@ -830,12 +865,16 @@ static void publish_rejection(const actor_header_t* in_hdr, reject_reason_t why)
 /* ── Heartbeat ───────────────────────────────────────────────────────────── */
 
 static void emit_heartbeat(void) {
-    char   payload[256];
+    char running[ACTOR_MAX_CONCURRENCY * 224];
+    running_json(running, sizeof(running));
+
+    char   payload[sizeof(running) + 256];
     size_t plen = (size_t)snprintf(payload, sizeof(payload),
-                                   "{\"id\":\"%s\",\"inbox\":%zu,\"outbox\":%zu}",
+                                   "{\"id\":\"%s\",\"inbox\":%zu,\"outbox\":%zu,\"running\":%s}",
                                    cfg.id,
                                    lmdb_count(dbi_inbox),
-                                   lmdb_count(dbi_outbox));
+                                   lmdb_count(dbi_outbox),
+                                   running);
     if (plen >= sizeof(payload)) plen = sizeof(payload) - 1;
 
     actor_header_t hdr;
@@ -847,6 +886,17 @@ static void emit_heartbeat(void) {
     memcpy(frame, &hdr, sizeof(actor_header_t));
     memcpy(frame + sizeof(actor_header_t), payload, plen);
     nng_send(nng_pub, frame, sizeof(actor_header_t) + plen, 0);
+}
+
+/* Send a heartbeat if one is due. One thread only: the reaper on Unix, so a
+   busy worker never delays it; the receive loop on Windows, which has none. */
+static void heartbeat_tick(void) {
+    static int64_t last_ms;
+    if (cfg.heartbeat_ms <= 0) return;
+    int64_t now = mono_ms();
+    if (last_ms && now - last_ms < cfg.heartbeat_ms) return;
+    emit_heartbeat();
+    last_ms = now;
 }
 
 /* ── Process one tuple ───────────────────────────────────────────────────── */
@@ -1053,8 +1103,6 @@ int actor_run(void) {
             cfg.id, cfg.topic, cfg.handler, ACTOR_MAX_PAYLOAD, cfg.concurrency);
     if (g_replay_n) fprintf(stderr, "[actor] replaying %d tuple(s) from the inbox\n", g_replay_n);
 
-    int64_t last_hb = 0;
-
 #ifndef _WIN32
     /* The reaper runs even at concurrency 1: it is what collects the orphaned
        grandchildren this process inherits as PID 1, a job the old between-
@@ -1079,19 +1127,9 @@ int actor_run(void) {
 #endif
 
     while (!g_stop) {
-        /* heartbeat — this thread only, so the interval does not multiply by
-           the worker count */
-        if (cfg.heartbeat_ms > 0) {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            int64_t now_ms = ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
-            if (now_ms - last_hb >= cfg.heartbeat_ms) {
-                emit_heartbeat();
-                last_hb = now_ms;
-            }
-        }
-
-        /* receive with 100ms timeout — unblocks for heartbeat check */
+#ifdef _WIN32
+        heartbeat_tick();
+#endif
         if (!serve_once()) break;
     }
 

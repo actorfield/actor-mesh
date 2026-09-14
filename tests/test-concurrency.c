@@ -519,6 +519,49 @@ static void t_term_names_its_target(void) {
     CHECK(results == 1 && rejected == 0, "a _term reached a tuple it did not name");
 }
 
+/* ── 9. Status ──────────────────────────────────────────────────────────── */
+
+/* The last payload containing `must` seen on s within budget ms. */
+static void last_payload(nng_socket s, int budget, const char *must, char *buf, size_t cap) {
+    buf[0] = 0;
+    for (int64_t end = now_ms() + budget; now_ms() < end; ) {
+        nng_msg *m = NULL;
+        if (nng_recvmsg(s, &m, 0) != 0) continue;
+        char tmp[8192];
+        size_t l = nng_msg_len(m) > 256 ? nng_msg_len(m) - 256 : 0;
+        if (l >= sizeof tmp) l = sizeof tmp - 1;
+        memcpy(tmp, (uint8_t *)nng_msg_body(m) + 256, l); tmp[l] = 0;
+        nng_msg_free(m);
+        if (strstr(tmp, must)) snprintf(buf, cap, "%s", tmp);
+    }
+}
+
+static void t_heartbeat_lists_running(void) {
+    TEST("the heartbeat lists what is running, and nothing once it is done");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/tc_hb; mkdir -p /tmp/tc_hb");
+    char *a[] = { "./bin/actor", NULL };
+    char *e[] = { "ACTOR_BUS_SUB=" SP, "ACTOR_BUS_PUB=" PP, "ACTOR_HEARTBEAT_MS=200",
+                  "ACTOR_ID=tc", "ACTOR_TOPIC=work", "ACTOR_RESULT_TOPIC=done",
+                  "ACTOR_HANDLER=sh -c 'sleep 1.5; echo :ok'", "ACTOR_RETRY_MAX=0",
+                  "ACTOR_LMDB_PATH=/tmp/tc_hb", NULL };
+    pid_t ap = sp_(a, e); ms(700);
+    nng_socket hb = sub_open("heartbeat");
+    sendm_as("test", "work", "x", 0, 0, 0x41);
+    char busy[8192], idle[8192];
+    last_payload(hb, 900, "\"id\":\"tc\"", busy, sizeof busy);
+    ms(1200);
+    last_payload(hb, 600, "\"id\":\"tc\"", idle, sizeof idle);
+    nng_close(hb);
+    stop(pp, ap);
+    printf("  busy: %.170s\n  idle: %.170s\n", busy, idle);
+    CHECK(strstr(busy, "\"correlation\":\"41414141414141414141414141414141\"") &&
+          strstr(busy, "\"topic\":\"work\"") && strstr(busy, "\"terminating\":false"),
+          "the heartbeat did not list the running tuple");
+    CHECK(strstr(idle, "\"running\":[]") != NULL, "the heartbeat still listed a finished tuple");
+}
+
 int main(void) {
     printf("actor concurrency tests\n\n");
     t_parallel();
@@ -536,6 +579,7 @@ int main(void) {
     t_term_stops_the_group();
     t_term_escalates_to_kill();
     t_term_names_its_target();
+    t_heartbeat_lists_running();
     cleanup();
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED",
            failures, failures == 1 ? "" : "s");

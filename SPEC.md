@@ -313,12 +313,10 @@ procedure actor_run() : {0, −1}:
   if NngSetup(cfg) < 0: return −1
   if LmdbSetup(cfg) < 0: return −1
 
-  last_hb ← 0
+  — heartbeats come from the reaper thread every cfg.heartbeat_ms, so a
+    busy worker never delays them; on Windows, which has none, this loop
+    sends them
   while ¬g_stop:
-    if cfg.heartbeat_ms > 0  ∧  now_ms() − last_hb ≥ cfg.heartbeat_ms:
-      EmitHeartbeat(cfg.id)
-      last_hb ← now_ms()
-
     msg ← ⊥
     rc ← nng_recvmsg(nng_sub, &msg, 0)    — 100ms timeout
     if rc = NNG_ETIMEDOUT:  continue
@@ -484,7 +482,10 @@ procedure PublishRejection(in_hdr : actor_header_t*, reason : char[*]):
 procedure EmitHeartbeat(id : char[32]):
   inbox_sz  ← LmdbCount(dbi_inbox)
   outbox_sz ← LmdbCount(dbi_outbox)
-  payload   ← FormatJson({ id: id, inbox: inbox_sz, outbox: outbox_sz })
+  running   ← [ { tuple, correlation, topic, pid, age_ms, terminating }
+                | slot ∈ children, slot busy ]      — [] on Windows
+  payload   ← FormatJson({ id: id, inbox: inbox_sz, outbox: outbox_sz,
+                           running: running })
   plen      ← strlen(payload)
 
   Init(&hdr, "heartbeat", id, null, null, plen)
