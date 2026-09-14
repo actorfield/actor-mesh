@@ -27,7 +27,7 @@ bash test-mcp-mesh.sh "how many employees?"
 | Binary | Purpose |
 |---|---|
 | `bin/actor` | Runtime — forks handlers, manages LMDB, connects to mesh |
-| `bin/mesh-proxy` | Bus — forwards pub/sub messages, ~60 LOC |
+| `bin/mesh-proxy` | Bus — forwards pub/sub messages, ~130 LOC |
 | `bin/llm-agent` | ReAct agent handler — calls LLM, uses tools |
 | `handlers/tools/shell-exec.sh` | Run shell commands as an actor |
 

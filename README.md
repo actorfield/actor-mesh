@@ -3,7 +3,7 @@
 A minimal distributed actor mesh built on Unix primitives.  
 No frameworks. No sidecars. No brokers. Just processes.
 
-**Runtime:** ~624 lines of C &nbsp;|&nbsp; **Proxy:** ~100 lines of C &nbsp;|&nbsp; **Handler:** any process that speaks stdio
+**Runtime:** ~1,500 lines of C, plus ~1,300 of optional isolation &nbsp;|&nbsp; **Proxy:** ~130 lines of C &nbsp;|&nbsp; **Handler:** any process that speaks stdio
 
 ---
 
@@ -55,7 +55,7 @@ bash test-mcp-mesh.sh "how many employees?"
 | Binary | Purpose |
 |--------|---------|
 | `bin/actor` | Runtime — forks handlers, manages LMDB, connects to mesh |
-| `bin/mesh-proxy` | Bus — forwards pub/sub messages, ~100 LOC |
+| `bin/mesh-proxy` | Bus — forwards pub/sub messages, ~130 LOC |
 | `bin/llm-agent` | ReAct agent handler — calls LLM, uses tools |
 
 ## Adding Your Own Agent

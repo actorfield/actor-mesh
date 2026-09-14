@@ -1,7 +1,7 @@
 # Actor Mesh — Formal Specification
 
-A distributed actor mesh built on Unix primitives. Runtime: 624 lines of C.
-Proxy: 100 lines of C. Handler: any process that speaks stdio.
+A distributed actor mesh built on Unix primitives. Runtime: ~1,500 lines of C.
+Proxy: ~130 lines of C. Handler: any process that speaks stdio.
 
 ---
 

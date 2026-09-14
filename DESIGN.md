@@ -5,7 +5,8 @@
 A minimal distributed actor mesh built on Unix primitives.
 No frameworks. No sidecars. No brokers. Just processes.
 
-The runtime is ~506 lines of C. The proxy is ~57 lines of C.
+The runtime is ~1,500 lines of C, plus ~1,300 for optional isolation.
+The proxy is ~130 lines, most of it the forwarder it shares with the actor.
 A handler is any process that speaks stdio.
 
 ---
@@ -174,13 +175,15 @@ int main(void) {
 ## Runtime Lifecycle
 
 ```
-1. Read config from environment
+1. Read config from environment; build lanes, collect services
 2. Apply isolation if configured — before sockets, LMDB, or any thread
-3. Connect NNG pub0 + sub0 to proxy
-4. Open LMDB
-5. Enter poll loop:
-   a. Emit heartbeat every ACTOR_HEARTBEAT_MS
-   b. NNG recvmsg (100ms timeout)
+3. Run ACTOR_INIT; open the built-in bus if PROXY_*_BIND is set
+4. Connect NNG pub0, one sub0 per lane, and the _term control socket
+5. Open LMDB and collect the inbox to replay; start services
+6. Start the reaper — reaps, restarts services, acts on _term, sends the
+   heartbeat — and each lane's workers, which loop:
+   a. Take this lane's next replay, if any
+   b. Otherwise NNG recvmsg (100ms timeout)
    c. Receive header + payload as single buffer
    d. Cast to actor_header_t (zero copy)
    e. Check TTL — drop if expired
@@ -192,7 +195,7 @@ int main(void) {
    k. Write result frame to LMDB outbox
    l. Publish result to NNG bus
    m. Clear LMDB inbox + outbox
-6. On SIGTERM — stop receiving, let running handlers finish, exit.
+7. On SIGTERM — stop receiving, let running handlers finish, exit.
    One that fails is not retried; it stays in the inbox for the next run.
 ```
 
@@ -553,13 +556,13 @@ actor-mesh/
 ├── DESIGN.md
 ├── runtime/
 │   ├── actor.h                 public API — actor_run()
-│   ├── actor.c                 runtime (~506 lines, zero malloc)
+│   ├── actor.c                 runtime (~1,500 lines, no heap per tuple)
 │   ├── actor_tuple.h           256-byte header + helpers
 │   ├── actor_uuid.h            uuidv7 single-header, no deps
 │   ├── bus.c, bus.h            pub/sub forwarder, shared with the proxy
 │   └── main.c                  12-line entrypoint
 ├── proxy/
-│   └── proxy.c                 NNG pub/sub fanout (~57 lines)
+│   └── proxy.c                 heartbeat around the shared forwarder
 ├── examples/
 │   └── employee-mesh/          HR Q&A demo (ReAct loop over SQLite)
 │       ├── Makefile            build + run + query
