@@ -14,6 +14,7 @@
 #include "actor.h"
 #include "actor_tuple.h"
 #include "actor_uuid.h"
+#include "bus.h"
 #ifndef _WIN32
 #  include "actor_isolation.h"
 #endif
@@ -796,6 +797,51 @@ static int run_init(void) {
     return 0;
 }
 
+/* ── Built-in bus ──────────────────────────────────────────────────────────
+ *
+ * An actor given PROXY_SUB_BIND and PROXY_PUB_BIND hosts the bus itself, on a
+ * thread of its own, listening before anything here dials it and closing
+ * after everything else. */
+static bus_t      g_bus;
+static pthread_t  g_bus_thread;
+static bool       g_bus_hosted;
+static atomic_int g_bus_stop;
+
+static void* bus_main(void* arg) {
+    (void)arg;
+    while (!atomic_load(&g_bus_stop)) bus_forward_once(&g_bus);
+    return NULL;
+}
+
+static int bus_host(void) {
+    const char* sub = getenv("PROXY_SUB_BIND");
+    const char* pub = getenv("PROXY_PUB_BIND");
+    if (!sub && !pub) return 0;
+    if (!sub || !pub) {
+        fprintf(stderr, "[actor] hosting the bus needs both PROXY_SUB_BIND and PROXY_PUB_BIND\n");
+        return -1;
+    }
+    int rc = bus_open(&g_bus, sub, pub);
+    if (rc != 0) {
+        fprintf(stderr, "[actor] bus: %s\n", nng_strerror(rc));
+        return -1;
+    }
+    if (pthread_create(&g_bus_thread, NULL, bus_main, NULL) != 0) {
+        fprintf(stderr, "[actor] could not start the bus thread\n");
+        bus_close(&g_bus);
+        return -1;
+    }
+    g_bus_hosted = true;
+    return 0;
+}
+
+static void bus_unhost(void) {
+    if (!g_bus_hosted) return;
+    atomic_store(&g_bus_stop, 1);
+    pthread_join(g_bus_thread, NULL);
+    bus_close(&g_bus);
+}
+
 /* Reaper thread: the only caller of waitpid in the process. */
 static void* reaper_main(void* arg) {
     (void)arg;
@@ -1341,8 +1387,10 @@ static void* worker_main(void* arg) {
 int actor_run(void) {
     if (cfg_load() < 0 || lanes_load() < 0) return -1;
 #ifdef _WIN32
-    if (getenv("ACTOR_INIT") || services_requested()) {
-        fprintf(stderr, "[actor] ACTOR_INIT and ACTOR_SERVICE_* are not available on Windows\n");
+    if (getenv("ACTOR_INIT") || services_requested() ||
+        getenv("PROXY_SUB_BIND") || getenv("PROXY_PUB_BIND")) {
+        fprintf(stderr, "[actor] ACTOR_INIT, ACTOR_SERVICE_* and hosting the bus "
+                        "are not available on Windows\n");
         return -1;
     }
 #else
@@ -1358,7 +1406,7 @@ int actor_run(void) {
         fprintf(stderr, "[actor] FATAL: isolation requested but not applied\n");
         return -1;
     }
-    if (run_init() < 0) return -1;
+    if (run_init() < 0 || bus_host() < 0) return -1;
 #endif
 
     signal(SIGTERM, on_signal);
@@ -1420,6 +1468,7 @@ int actor_run(void) {
     for (int i = 0; i < g_nlanes; i++) nng_close(g_lanes[i].sub);
 #ifndef _WIN32
     nng_close(nng_ctl);
+    bus_unhost();
 #endif
     mdb_env_close(mdb_env);
 #ifndef _WIN32

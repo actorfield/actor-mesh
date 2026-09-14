@@ -45,12 +45,12 @@ all: actor mesh-proxy actor-confine
 bin/:
 	mkdir -p bin
 
-actor: runtime/main.c runtime/actor.c runtime/actor_isolation.c runtime/actor.h \
-       runtime/actor_tuple.h runtime/actor_uuid.h runtime/actor_isolation.h | bin/
-	$(CC) $(CFLAGS) $(LDFLAGS) runtime/main.c runtime/actor.c runtime/actor_isolation.c $(LIBS) -o bin/actor
+actor: runtime/main.c runtime/actor.c runtime/actor_isolation.c runtime/bus.c runtime/actor.h \
+       runtime/actor_tuple.h runtime/actor_uuid.h runtime/actor_isolation.h runtime/bus.h | bin/
+	$(CC) $(CFLAGS) $(LDFLAGS) runtime/main.c runtime/actor.c runtime/actor_isolation.c runtime/bus.c $(LIBS) -o bin/actor
 
-mesh-proxy: proxy/proxy.c | bin/
-	$(CC) $(CFLAGS) $(LDFLAGS) proxy/proxy.c $(LIBS) -o bin/mesh-proxy
+mesh-proxy: proxy/proxy.c runtime/bus.c runtime/bus.h | bin/
+	$(CC) $(CFLAGS) $(LDFLAGS) proxy/proxy.c runtime/bus.c $(LIBS) -o bin/mesh-proxy
 
 # No $(LIBS): this links the isolation unit alone and never touches nng.
 actor-confine: tools/actor-confine.c runtime/actor_isolation.c runtime/actor_isolation.h | bin/

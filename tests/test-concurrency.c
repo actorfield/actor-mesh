@@ -757,6 +757,37 @@ static void t_service_lives_with_the_actor(void) {
     CHECK(running == 1 && left == 0 && code == 0, "the service did not stop with the actor");
 }
 
+/* ── 13. Built-in bus ─────────────────────────────────────────────────────── */
+
+static void t_actor_hosts_the_bus(void) {
+    TEST("an actor with PROXY_*_BIND set is its own bus: no mesh-proxy needed");
+    cleanup();                                   /* no proxy is running */
+    const char *x[] = { "ACTOR_HEARTBEAT_MS=0", "ACTOR_HANDLER=sh -c 'echo :ok'",
+                        "PROXY_SUB_BIND=" PP, "PROXY_PUB_BIND=" SP, NULL };
+    pid_t ap = spawn_with("/tmp/tc_bus", x);
+    ms(700);
+    nng_socket done = sub_open("done");
+    sendm("work", "x", 0, 0);
+    char got[64] = {0};
+    int n = drain_n(done, 3000, 1, got, sizeof got);
+    nng_close(done);
+    stop(-1, ap);
+    printf("  result=%.10s\n", got);
+    CHECK(n == 1 && strncmp(got, ":ok", 3) == 0, "no result through the actor's own bus");
+}
+
+static void t_half_a_bus_fails(void) {
+    TEST("PROXY_SUB_BIND without PROXY_PUB_BIND refuses to start");
+    cleanup();
+    const char *x[] = { "ACTOR_HEARTBEAT_MS=0", "ACTOR_HANDLER=sh -c 'echo :ok'",
+                        "PROXY_SUB_BIND=" PP, NULL };
+    pid_t ap = spawn_with("/tmp/tc_bus2", x);
+    int code = exit_code(ap, 3000);
+    stop(-1, code >= 0 ? -1 : ap);
+    printf("  exit=%d\n", code);
+    CHECK(code > 0, "an actor with half a bus configured started anyway");
+}
+
 int main(void) {
     printf("actor concurrency tests\n\n");
     t_parallel();
@@ -783,6 +814,8 @@ int main(void) {
     t_init_failure_stops();
     t_service_restarts_then_gives_up();
     t_service_lives_with_the_actor();
+    t_actor_hosts_the_bus();
+    t_half_a_bus_fails();
     cleanup();
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED",
            failures, failures == 1 ? "" : "s");

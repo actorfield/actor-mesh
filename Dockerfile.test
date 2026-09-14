@@ -11,9 +11,9 @@ COPY examples/employee-mesh/Makefile  /src/examples/employee-mesh/
 COPY examples/employee-mesh/handlers/ /src/examples/employee-mesh/handlers/
 RUN mkdir -p bin && \
     gcc -Wall -Wextra -O2 -std=c11 -Iruntime \
-        runtime/main.c runtime/actor.c runtime/actor_isolation.c \
+        runtime/main.c runtime/actor.c runtime/actor_isolation.c runtime/bus.c \
         -lnng -llmdb -o bin/actor && \
-    gcc -Wall -Wextra -O2 -std=c11 -Iruntime proxy/proxy.c -lnng -llmdb -o bin/mesh-proxy && \
+    gcc -Wall -Wextra -O2 -std=c11 -Iruntime proxy/proxy.c runtime/bus.c -lnng -llmdb -o bin/mesh-proxy && \
     gcc -Wall -Wextra -O2 -std=c11 -Iruntime tests/test-isolation.c -lnng -o bin/test-isolation && \
     gcc -Wall -Wextra -O2 -std=c11 tests/test-concurrency.c -lnng -o bin/test-concurrency && \
     gcc -Wall -Wextra -O2 -std=c11 tests/test-mesh.c -lnng -o bin/test-mesh && \

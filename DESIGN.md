@@ -482,6 +482,23 @@ Both inherit the actor's isolation. Neither is available on Windows.
 
 ---
 
+## Built-in bus
+
+`mesh-proxy` is a forwarder with two sockets. An actor given the same two
+variables runs that forwarder itself, on a thread of its own:
+
+```sh
+PROXY_SUB_BIND=tcp://127.0.0.1:5557 PROXY_PUB_BIND=tcp://127.0.0.1:5556 \
+ACTOR_BUS_PUB=tcp://127.0.0.1:5557  ACTOR_BUS_SUB=tcp://127.0.0.1:5556 ... ./actor
+```
+
+The bus listens before the actor dials it and before any service starts, so
+nothing waits on start-up order, and it closes last. Everything else on the
+mesh dials it exactly as it would dial `mesh-proxy`. It sends no heartbeat of
+its own; the actor's covers it. Not available on Windows.
+
+---
+
 ## Configuration
 
 | Variable | Required | Default | Description |
@@ -524,6 +541,8 @@ Proxy:
 | `PROXY_SUB_BIND` | `tcp://*:5557` | Actors publish here |
 | `PROXY_PUB_BIND` | `tcp://*:5556` | Actors subscribe here |
 
+Set both on an actor and it hosts the bus itself; see [Built-in bus](#built-in-bus).
+
 ---
 
 ## File Layout
@@ -537,6 +556,7 @@ actor-mesh/
 │   ├── actor.c                 runtime (~506 lines, zero malloc)
 │   ├── actor_tuple.h           256-byte header + helpers
 │   ├── actor_uuid.h            uuidv7 single-header, no deps
+│   ├── bus.c, bus.h            pub/sub forwarder, shared with the proxy
 │   └── main.c                  12-line entrypoint
 ├── proxy/
 │   └── proxy.c                 NNG pub/sub fanout (~57 lines)

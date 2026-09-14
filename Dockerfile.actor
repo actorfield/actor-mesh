@@ -5,7 +5,7 @@ RUN apk add --no-cache gcc musl-dev nng-dev lmdb-dev
 COPY runtime/ /src/runtime/
 WORKDIR /src
 RUN gcc -Wall -Wextra -Os -std=c11 \
-    runtime/main.c runtime/actor.c runtime/actor_isolation.c \
+    runtime/main.c runtime/actor.c runtime/actor_isolation.c runtime/bus.c \
     -lnng -llmdb -o /actor && \
     strip /actor
 

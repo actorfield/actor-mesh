@@ -197,6 +197,9 @@ Service ≙ { name, cmd, pid, restarts }        — ACTOR_SERVICE_<name>=<cmd>
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+The forwarder is runtime/bus.c. An actor with both PROXY_SUB_BIND and
+PROXY_PUB_BIND set runs the same forwarder on a thread of its own (Unix).
+
 ---
 
 ## §5 LMDB Durability
