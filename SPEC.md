@@ -1,7 +1,7 @@
 # Actor Mesh — Formal Specification
 
 A distributed actor mesh built on Unix primitives. Runtime: 624 lines of C.
-Proxy: 193 lines of C. Handler: any process that speaks stdio.
+Proxy: 100 lines of C. Handler: any process that speaks stdio.
 
 ---
 
@@ -177,14 +177,12 @@ payload(h : actor_header_t*) : uint8*  ≙  (uint8*)(h + 1)
 ┌─ ProxyState ────────────────────────────────────────────────────────┐
 │ sub_sock       : nng_socket    — binds PROXY_SUB_BIND (sub0)        │
 │ pub_sock       : nng_socket    — binds PROXY_PUB_BIND (pub0)        │
-│ http_fd        : ℤ             — IPv6 TCP listener on :8082         │
 │ g_stop         : 𝔹             — true → exit                       │
 │ proxy_id       : char[32]      — PROXY_ID, default "proxy"          │
 │ hb_ms          : ℕ             — PROXY_HEARTBEAT_MS, default 5000   │
 ├─────────────────────────────────────────────────────────────────────┤
 │ sub_sock subscribes ""  — wildcard: receives ALL messages           │
 │ pub_sock binds all addresses in comma-separated URL list            │
-│ http_fd = −1  if port 8082 unavailable (non-fatal)                  │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -499,7 +497,6 @@ procedure EmitHeartbeat(id : char[32]):
 procedure proxy_main():
   signal(SIGTERM, → g_stop ← 1)
   signal(SIGINT,  → g_stop ← 1)
-  signal(SIGCHLD, SIG_IGN)           — reap forked HTTP children
 
   sub ← Sub0Open()
   pub ← Pub0Open()
@@ -509,20 +506,11 @@ procedure proxy_main():
   ListenAll(pub, PROXY_PUB_BIND)     — "tcp://*:5556" default
   SetRecvTimeout(sub, 100ms)
 
-  — HTTP bridge (optional, non-blocking)
-  http_fd ← TcpListen(:8082, NONBLOCK)
-
   last_hb ← 0
   while ¬g_stop:
     if now_ms() − last_hb ≥ hb_ms:
       EmitHeartbeat(proxy_id)
       last_hb ← now_ms()
-
-    — HTTP accept (non-blocking)
-    cfd ← accept(http_fd, ...)
-    if cfd ≥ 0:
-      HttpHandle(cfd)    — inline: parse POST, publish via nngcat popen
-      close(cfd)
 
     — Mesh forwarding
     msg ← ⊥
@@ -532,7 +520,6 @@ procedure proxy_main():
     nng_sendmsg(pub, msg, 0)         — forward to all subscribers
     nng_msg_free(msg)
 
-  close(http_fd)
   nng_close(pub)
   nng_close(sub)
 ```
@@ -862,7 +849,6 @@ procedure ParseCausationId(frame : uint8*, flen : ℕ, out : UUID):
 │ PROXY_HEARTBEAT_MS   : ℕ        — optional, default 5000            │
 ├─────────────────────────────────────────────────────────────────────┤
 │ Bind URLs support comma-separated lists for multi-homed hosts       │
-│ HTTP bridge on :8082 is always-on (fails silently if port in use)   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
