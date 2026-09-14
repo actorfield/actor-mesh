@@ -27,10 +27,10 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <time.h>
-#include <sys/wait.h>
 
 #ifndef _WIN32
 #  include <pthread.h>
+#  include <sys/wait.h>
 #endif
 
 #ifdef _WIN32
@@ -345,7 +345,8 @@ static run_status_t platform_spawn(const uint8_t* in,  size_t in_len,
     SetHandleInformation(stdin_wr,  HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(stdout_rd, HANDLE_FLAG_INHERIT, 0);
 
-    STARTUPINFOA si = { sizeof(si) };
+    STARTUPINFOA si = {0};
+    si.cb         = sizeof(si);
     si.hStdInput  = stdin_rd;
     si.hStdOutput = stdout_wr;
     si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
