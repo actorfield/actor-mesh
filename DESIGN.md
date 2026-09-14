@@ -126,6 +126,23 @@ ACTOR_TOPIC=user_message,sql_result ./actor
 
 One actor instance receives tuples on all listed topics.
 
+### Lanes
+
+A topic can have its own handler, result topic or concurrency:
+
+```sh
+ACTOR_TOPIC=sql_query,cancel
+ACTOR_HANDLER=./handlers/sqlite-tool   ACTOR_CONCURRENCY=4
+ACTOR_HANDLER_cancel=./handlers/cancel ACTOR_CONCURRENCY_cancel=1
+```
+
+A topic with a setting of its own becomes a lane: its own socket and its own
+workers, so it never waits behind another topic's work. Topics without one
+share the default lane, which is the whole actor when nothing is set. The
+lanes together may use at most 32 workers; asking for more fails startup.
+Per-topic settings need identifier topics (`[A-Za-z0-9_]`), the same rule as
+a handler's topic override.
+
 ---
 
 ## Handler Examples
@@ -458,6 +475,7 @@ publish to the bus can send one — the same trust as any other publish.
 | `ACTOR_RETRY_MAX` | ☐ | 3 | Max handler retries |
 | `ACTOR_CONCURRENCY` | ☐ | 1 | Messages in flight at once (max 32) |
 | `ACTOR_TERM_GRACE_MS` | ☐ | 5000 | SIGTERM to SIGKILL grace for `_term` (Unix) |
+| `ACTOR_HANDLER_<topic>`, `ACTOR_RESULT_TOPIC_<topic>`, `ACTOR_CONCURRENCY_<topic>` | ☐ | — | Give a topic its own lane (see [Lanes](#lanes)) |
 
 Isolation (Linux, all optional — see [Isolation](#isolation)):
 

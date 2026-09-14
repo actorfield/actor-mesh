@@ -155,10 +155,103 @@ static int cfg_load(void) {
     return 0;
 }
 
+/* ── Lanes ───────────────────────────────────────────────────────────────── */
+
+/* A lane is a set of topics served by one handler, with its own socket and
+   workers. Topics without an ACTOR_{HANDLER,RESULT_TOPIC,CONCURRENCY}_<topic>
+   setting share the default lane; a topic with one gets a lane of its own, so
+   it never waits behind the others. With no such settings there is one lane:
+   the actor as it always was. */
+#define ACTOR_MAX_LANES 16
+
+typedef struct {
+    char        topics[256];   /* comma-separated, as subscribed */
+    const char* handler;
+    const char* result_topic;
+    int         concurrency;
+    nng_socket  sub;
+} lane_t;
+
+static lane_t g_lanes[ACTOR_MAX_LANES];
+static int    g_nlanes;
+
+static const char* topic_env(const char* name, const char* topic) {
+    char key[64];
+    snprintf(key, sizeof(key), "%s_%s", name, topic);
+    return getenv(key);
+}
+
+static int lanes_load(void) {
+    char list[256];
+    snprintf(list, sizeof(list), "%s", cfg.topic);
+    lane_t* shared = NULL;
+    int     total  = 0;
+    char*   save   = NULL;
+    for (char* t = strtok_r(list, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
+        while (*t == ' ') t++;
+        if (!*t) continue;
+        const char* h  = topic_env("ACTOR_HANDLER", t);
+        const char* rt = topic_env("ACTOR_RESULT_TOPIC", t);
+        const char* cc = topic_env("ACTOR_CONCURRENCY", t);
+        bool        own = h || rt || cc;
+        lane_t*     l   = own ? NULL : shared;
+        if (!l) {
+            if (g_nlanes == ACTOR_MAX_LANES) {
+                fprintf(stderr, "[actor] ACTOR_TOPIC needs more than %d lanes\n", ACTOR_MAX_LANES);
+                return -1;
+            }
+            l = &g_lanes[g_nlanes++];
+            l->handler      = h  ? h  : cfg.handler;
+            l->result_topic = rt ? rt : cfg.result_topic;
+            l->concurrency  = cfg.concurrency;
+            if (cc) {
+                l->concurrency = atoi(cc);
+                if (l->concurrency < 1) l->concurrency = 1;
+            }
+            total += l->concurrency;
+            if (!own) shared = l;
+        }
+        size_t used = strlen(l->topics);
+        snprintf(l->topics + used, sizeof(l->topics) - used, "%s%s", used ? "," : "", t);
+    }
+    if (g_nlanes == 0) {
+        fprintf(stderr, "[actor] ACTOR_TOPIC names no topic\n");
+        return -1;
+    }
+    if (total > ACTOR_MAX_CONCURRENCY) {
+        fprintf(stderr, "[actor] lanes ask for %d workers; the most is %d\n",
+                total, ACTOR_MAX_CONCURRENCY);
+        return -1;
+    }
+#ifdef _WIN32
+    if (g_nlanes > 1) {
+        fprintf(stderr, "[actor] per-topic lanes need more than one worker, which Windows lacks\n");
+        return -1;
+    }
+#endif
+    return 0;
+}
+
+/* The lane serving a header's topic; lane 0 if none does any more. */
+static int lane_of(const char topic[32]) {
+    char t[33];
+    snprintf(t, sizeof(t), "%.*s", 32, topic);
+    size_t n = strlen(t);
+    for (int i = 0; i < g_nlanes; i++) {
+        for (const char* p = g_lanes[i].topics; *p; ) {
+            const char* e   = strchr(p, ',');
+            size_t      len = e ? (size_t)(e - p) : strlen(p);
+            if (len == n && memcmp(p, t, n) == 0) return i;
+            if (!e) break;
+            p = e + 1;
+        }
+    }
+    return 0;
+}
+
 /* ── State ───────────────────────────────────────────────────────────────── */
 
 static nng_socket nng_pub;
-static nng_socket nng_sub;
 #ifndef _WIN32
 static nng_socket nng_ctl;   /* control topics, read by the reaper */
 #endif
@@ -169,10 +262,13 @@ static MDB_dbi    dbi_state;
 
 static volatile sig_atomic_t g_stop = 0;
 
-/* Inbox entries left by the previous run, replayed before new messages. */
+/* Inbox entries left by the previous run, replayed before new messages, each
+   by the lane its topic belongs to. */
 static uint8_t    g_replay[ACTOR_MAX_CONCURRENCY][16];
+static int        g_replay_lane[ACTOR_MAX_CONCURRENCY];
+static atomic_int g_replay_taken[ACTOR_MAX_CONCURRENCY];
 static int        g_replay_n;
-static atomic_int g_replay_next;
+static atomic_int g_replay_left;
 
 /* Where a worker's frame came from. A replayed one lives in g_frame_buf and
    is already in the inbox. */
@@ -190,6 +286,17 @@ static void on_signal(int s) { (void)s; g_stop = 1; }
 
 /* ── NNG ─────────────────────────────────────────────────────────────────── */
 
+/* The proxy may not be listening yet. */
+static int dial_retry(nng_socket s, const char* url, const char* what) {
+    for (int i = 0; i < 30; i++) {
+        int rc = nng_dial(s, url, NULL, 0);
+        if (rc == 0) return 0;
+        fprintf(stderr, "[actor] %s dial %s: %s (retry %d)\n", what, url, nng_strerror(rc), i);
+        sleep(1);
+    }
+    return -1;
+}
+
 static int nng_setup(void) {
     int rc;
 
@@ -197,49 +304,30 @@ static int nng_setup(void) {
         fprintf(stderr, "[actor] nng_pub0_open: %s\n", nng_strerror(rc));
         return -1;
     }
-    /* retry dial — proxy may not be listening yet */
-    for (int i = 0; i < 30; i++) {
-        rc = nng_dial(nng_pub, cfg.bus_pub, NULL, 0);
-        if (rc == 0) break;
-        fprintf(stderr, "[actor] pub dial %s: %s (retry %d)\n",
-                cfg.bus_pub, nng_strerror(rc), i);
-        sleep(1);
-    }
-    if (rc != 0) return -1;
+    if (dial_retry(nng_pub, cfg.bus_pub, "pub") < 0) return -1;
 
-    if ((rc = nng_sub0_open(&nng_sub)) != 0) {
-        fprintf(stderr, "[actor] nng_sub0_open: %s\n", nng_strerror(rc));
-        return -1;
-    }
-    for (int i = 0; i < 30; i++) {
-        rc = nng_dial(nng_sub, cfg.bus_sub, NULL, 0);
-        if (rc == 0) break;
-        fprintf(stderr, "[actor] sub dial %s: %s (retry %d)\n",
-                cfg.bus_sub, nng_strerror(rc), i);
-        sleep(1);
-    }
-    if (rc != 0) return -1;
-
-    /* ACTOR_TOPIC supports comma-separated list: "user_message,sql_result"
-     * NNG sub0 does prefix matching on the message body. The topic field
-     * is at offset 0 of actor_header_t, so subscribe with null-terminated
-     * topic string for exact (non-prefix) match. */
-    char topic_buf[256];
-    strncpy(topic_buf, cfg.topic, sizeof(topic_buf) - 1);
-    topic_buf[sizeof(topic_buf) - 1] = '\0';
-    char *saveptr; char* tok = strtok_r(topic_buf, ",", &saveptr);
-    while (tok) {
-        while (*tok == ' ') tok++;
-        size_t tlen = strlen(tok) + 1;  /* include null for exact match */
-        if ((rc = nng_socket_set(nng_sub, NNG_OPT_SUB_SUBSCRIBE, tok, tlen)) != 0) {
-            fprintf(stderr, "[actor] sub subscribe %s: %s\n", tok, nng_strerror(rc));
+    /* One SUB socket per lane. NNG sub0 prefix-matches on the message body and
+     * the topic sits at offset 0 of actor_header_t, so each topic is subscribed
+     * with its null terminator for an exact match. The 100ms receive timeout is
+     * how a worker notices g_stop. */
+    for (int i = 0; i < g_nlanes; i++) {
+        lane_t* l = &g_lanes[i];
+        if ((rc = nng_sub0_open(&l->sub)) != 0) {
+            fprintf(stderr, "[actor] nng_sub0_open: %s\n", nng_strerror(rc));
             return -1;
         }
-        tok = strtok_r(NULL, ",", &saveptr);
+        if (dial_retry(l->sub, cfg.bus_sub, "sub") < 0) return -1;
+        char  list[256];
+        char* save = NULL;
+        snprintf(list, sizeof(list), "%s", l->topics);
+        for (char* t = strtok_r(list, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
+            if ((rc = nng_socket_set(l->sub, NNG_OPT_SUB_SUBSCRIBE, t, strlen(t) + 1)) != 0) {
+                fprintf(stderr, "[actor] sub subscribe %s: %s\n", t, nng_strerror(rc));
+                return -1;
+            }
+        }
+        nng_socket_set_ms(l->sub, NNG_OPT_RECVTIMEO, 100);
     }
-
-    /* set recv timeout for heartbeat check granularity (100ms) */
-    nng_socket_set_ms(nng_sub, NNG_OPT_RECVTIMEO, 100);
 
 #ifndef _WIN32
     /* Its own socket, so a _term still arrives when every worker is busy. */
@@ -282,10 +370,14 @@ static int lmdb_setup(void) {
     if (mdb_cursor_open(txn, dbi_inbox, &cur) == 0) {
         while (g_replay_n < ACTOR_MAX_CONCURRENCY && mdb_cursor_get(cur, &k, &v, op) == 0) {
             op = MDB_NEXT;
-            if (k.mv_size == 16) memcpy(g_replay[g_replay_n++], k.mv_data, 16);
+            if (k.mv_size != 16) continue;
+            memcpy(g_replay[g_replay_n], k.mv_data, 16);
+            g_replay_lane[g_replay_n++] = v.mv_size >= sizeof(actor_header_t)
+                ? lane_of(((const actor_header_t*)v.mv_data)->topic) : 0;
         }
         mdb_cursor_close(cur);
     }
+    atomic_store(&g_replay_left, g_replay_n);
     mdb_txn_commit(txn);
     return 0;
 }
@@ -355,7 +447,7 @@ static void running_json(char* out, size_t cap) { snprintf(out, cap, "[]"); }
 static run_status_t platform_spawn(const uint8_t* in,  size_t in_len,
                                    uint8_t*       out, size_t out_cap,
                                    const child_env_t* env, const actor_header_t* hdr,
-                                   size_t* out_len) {
+                                   const char* handler, size_t* out_len) {
     (void)hdr;   /* _term is Unix-only: it needs process groups */
     /* Windows runs a single worker (cfg_load clamps concurrency to 1 there),
        so mutating the process environment before CreateProcess is safe. */
@@ -384,7 +476,7 @@ static run_status_t platform_spawn(const uint8_t* in,  size_t in_len,
     si.dwFlags    = STARTF_USESTDHANDLES;
 
     char cmdline[1024];
-    snprintf(cmdline, sizeof(cmdline), "cmd.exe /c %s", cfg.handler);
+    snprintf(cmdline, sizeof(cmdline), "cmd.exe /c %s", handler);
 
     PROCESS_INFORMATION pi = {0};
     if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
@@ -612,7 +704,7 @@ static child_exit_t await_child(int slot) {
 static run_status_t platform_spawn(const uint8_t* in,  size_t in_len,
                                    uint8_t*       out, size_t out_cap,
                                    const child_env_t* env, const actor_header_t* hdr,
-                                   size_t* out_len) {
+                                   const char* handler, size_t* out_len) {
     int to_child[2], from_child[2];
 
     if (pipe(to_child)   < 0) return RUN_FAILED;
@@ -630,7 +722,7 @@ static run_status_t platform_spawn(const uint8_t* in,  size_t in_len,
         pthread_mutex_unlock(&child_mu);
         close(to_child[0]); close(to_child[1]);
         close(from_child[0]); close(from_child[1]);
-        fprintf(stderr, "[actor] no free child slot (concurrency=%d)\n", cfg.concurrency);
+        fprintf(stderr, "[actor] no free child slot\n");
         return RUN_FAILED;
     }
 
@@ -674,7 +766,7 @@ static run_status_t platform_spawn(const uint8_t* in,  size_t in_len,
         dup2(from_child[1], STDOUT_FILENO);
         close(to_child[0]); close(to_child[1]);
         close(from_child[0]); close(from_child[1]);
-        execl("/bin/sh", "sh", "-c", cfg.handler, NULL);
+        execl("/bin/sh", "sh", "-c", handler, NULL);
         _exit(1);
     }
 
@@ -734,6 +826,7 @@ static run_status_t invoke_handler(const actor_header_t* hdr,
                                    const uint8_t*        payload,
                                    size_t                payload_len,
                                    int                   attempt,
+                                   const char*           handler,
                                    size_t*               result_len) {
     child_env_t env;
     actor_uuid_hex(hdr->id,             env.id_hex);
@@ -746,16 +839,16 @@ static run_status_t invoke_handler(const actor_header_t* hdr,
     snprintf(env.deadline, sizeof(env.deadline), "%lld", (long long)deadline);
 
     return platform_spawn(payload, payload_len, g_result_buf, ACTOR_MAX_PAYLOAD, &env,
-                          hdr, result_len);
+                          hdr, handler, result_len);
 }
 
 /* ── Publish ─────────────────────────────────────────────────────────────── */
 
 /* If handler output begins with a bare topic name on its own line
  * (e.g. "sql_query\n{...}"), use that topic and skip the prefix line.
- * Otherwise fall back to cfg.result_topic and use the full buffer.
+ * Otherwise fall back to the lane's result topic and use the full buffer.
  * A valid topic prefix: only [a-zA-Z0-9_] chars followed immediately by '\n'. */
-static const char* result_topic(size_t result_len, size_t* payload_off) {
+static const char* result_topic(size_t result_len, size_t* payload_off, const char* dflt) {
     *payload_off = 0;
     const char* p = (const char*)g_result_buf;
     size_t i = 0;
@@ -772,12 +865,13 @@ static const char* result_topic(size_t result_len, size_t* payload_off) {
         }
         i++;
     }
-    return cfg.result_topic;            /* default */
+    return dflt;
 }
 
-static void publish_result(const actor_header_t* in_hdr, size_t result_len) {
+static void publish_result(const actor_header_t* in_hdr, size_t result_len,
+                           const char* dflt_topic) {
     size_t        payload_off  = 0;
-    const char*   raw_topic    = result_topic(result_len, &payload_off);
+    const char*   raw_topic    = result_topic(result_len, &payload_off, dflt_topic);
 
     /* if the handler wrote a topic prefix, null-terminate it in the buffer */
     char topic_buf[32] = {0};
@@ -909,7 +1003,8 @@ static void heartbeat_tick(void) {
 static void process_tuple(const actor_header_t* hdr,
                           const uint8_t*        payload,
                           size_t                payload_len,
-                          tuple_source_t        source) {
+                          tuple_source_t        source,
+                          const lane_t*         lane) {
     /* hard cap on incoming payload */
     if (payload_len > ACTOR_MAX_PAYLOAD) {
         publish_rejection(hdr, REJECT_PAYLOAD_CAP_EXCEEDED);
@@ -933,10 +1028,10 @@ static void process_tuple(const actor_header_t* hdr,
     while (attempt <= cfg.retry_max) {
         size_t       result_len = 0;
         run_status_t run = invoke_handler(hdr, payload, payload_len,
-                                          hdr->attempt + attempt, &result_len);
+                                          hdr->attempt + attempt, lane->handler, &result_len);
         if (run == RUN_OK) {
             /* no output means nothing to publish */
-            if (result_len > 0) publish_result(hdr, result_len);
+            if (result_len > 0) publish_result(hdr, result_len, lane->result_topic);
             break;
         }
         if (run == RUN_TOO_LARGE) {
@@ -1001,46 +1096,47 @@ static void process_tuple(const actor_header_t* hdr,
  *
  */
 
-/* Copy the next unclaimed replay into g_frame_buf, as attempt + 1. */
-static bool replay_next(size_t* frame_len) {
-    if (atomic_load(&g_replay_next) >= g_replay_n) return false;
-    int i = atomic_fetch_add(&g_replay_next, 1);
-    if (i >= g_replay_n) return false;
+/* Copy this lane's next unclaimed replay into g_frame_buf, as attempt + 1. */
+static bool replay_next(int lane, size_t* frame_len) {
+    if (atomic_load(&g_replay_left) == 0) return false;
+    for (int i = 0; i < g_replay_n; i++) {
+        if (g_replay_lane[i] != lane || atomic_exchange(&g_replay_taken[i], 1)) continue;
+        atomic_fetch_sub(&g_replay_left, 1);
 
-    MDB_txn* txn;
-    MDB_val  k = { 16, g_replay[i] }, v;
-    if (mdb_txn_begin(mdb_env, NULL, MDB_RDONLY, &txn) != 0) return false;
-    bool found = mdb_get(txn, dbi_inbox, &k, &v) == 0;
-    bool fits  = found && v.mv_size >= sizeof(actor_header_t) && v.mv_size <= ACTOR_MAX_FRAME;
-    if (fits) {
-        memcpy(g_frame_buf, v.mv_data, v.mv_size);
-        ((actor_header_t*)g_frame_buf)->attempt++;
-        *frame_len = v.mv_size;
+        MDB_txn* txn;
+        MDB_val  k = { 16, g_replay[i] }, v;
+        if (mdb_txn_begin(mdb_env, NULL, MDB_RDONLY, &txn) != 0) return false;
+        bool found = mdb_get(txn, dbi_inbox, &k, &v) == 0;
+        bool fits  = found && v.mv_size >= sizeof(actor_header_t) && v.mv_size <= ACTOR_MAX_FRAME;
+        if (fits) {
+            memcpy(g_frame_buf, v.mv_data, v.mv_size);
+            ((actor_header_t*)g_frame_buf)->attempt++;
+            *frame_len = v.mv_size;
+        }
+        mdb_txn_abort(txn);
+        if (found && !fits) {
+            fprintf(stderr, "[actor] inbox entry of %zu bytes cannot be replayed, dropping\n",
+                    v.mv_size);
+            lmdb_del(dbi_inbox, g_replay[i], 16);
+        }
+        return fits;
     }
-    mdb_txn_abort(txn);
-    if (found && !fits) {
-        fprintf(stderr, "[actor] inbox entry of %zu bytes cannot be replayed, dropping\n",
-                v.mv_size);
-        lmdb_del(dbi_inbox, g_replay[i], 16);
-    }
-    return fits;
+    return false;
 }
 
-/* One turn of the receive loop, shared by every worker; false means stop.
-   Split out of actor_run so extra workers can run the
-   identical cycle -- the only thing that must NOT be duplicated per worker is
-   the heartbeat, which stays in actor_run. */
-static bool serve_once(void) {
+/* One turn of a lane's receive loop, shared by its workers; false means stop. */
+static bool serve_once(int lane) {
+    const lane_t*  l   = &g_lanes[lane];
     nng_msg*       msg = NULL;
     const uint8_t* frame;
     size_t         frame_len;
     tuple_source_t source;
 
-    if (replay_next(&frame_len)) {
+    if (replay_next(lane, &frame_len)) {
         source = TUPLE_REPLAYED;
         frame  = g_frame_buf;
     } else {
-        int rc = nng_recvmsg(nng_sub, &msg, 0);
+        int rc = nng_recvmsg(l->sub, &msg, 0);
         if (rc == NNG_ETIMEDOUT) return true;
         if (rc != 0) {
             if (!g_stop) fprintf(stderr, "[actor] recv error: %s\n", nng_strerror(rc));
@@ -1069,27 +1165,27 @@ static bool serve_once(void) {
         publish_rejection(hdr, REJECT_TTL_EXPIRED);
         if (source == TUPLE_REPLAYED) lmdb_del(dbi_inbox, hdr->id, 16);
     } else {
-        process_tuple(hdr, payload, payload_len, source);
+        process_tuple(hdr, payload, payload_len, source, l);
     }
     if (msg) nng_msg_free(msg);
     return true;
 }
 
 #ifndef _WIN32
-/* Extra worker. nng sockets are safe to use from several threads, so each
-   worker simply blocks in its own recv; the SUB socket hands each message to
-   exactly one of them. */
+/* Extra worker, bound to one lane. nng sockets are safe to use from several
+   threads, so each worker simply blocks in its own recv; the lane's SUB socket
+   hands each message to exactly one of them. */
 static void* worker_main(void* arg) {
-    (void)arg;
+    int lane = (int)(intptr_t)arg;
     while (!g_stop) {
-        if (!serve_once()) break;
+        if (!serve_once(lane)) break;
     }
     return NULL;
 }
 #endif
 
 int actor_run(void) {
-    if (cfg_load() < 0) return -1;
+    if (cfg_load() < 0 || lanes_load() < 0) return -1;
 
 #ifndef _WIN32
     /* Confinement goes here and nowhere else: after the config read, before
@@ -1110,6 +1206,10 @@ int actor_run(void) {
 
     fprintf(stderr, "[actor] id=%s topic(s)=%s handler=%s max_payload=%d concurrency=%d\n",
             cfg.id, cfg.topic, cfg.handler, ACTOR_MAX_PAYLOAD, cfg.concurrency);
+    for (int i = 0; g_nlanes > 1 && i < g_nlanes; i++)
+        fprintf(stderr, "[actor] lane %d: topic(s)=%s handler=%s result=%s concurrency=%d\n",
+                i, g_lanes[i].topics, g_lanes[i].handler, g_lanes[i].result_topic,
+                g_lanes[i].concurrency);
     if (g_replay_n) fprintf(stderr, "[actor] replaying %d tuple(s) from the inbox\n", g_replay_n);
 
 #ifndef _WIN32
@@ -1123,15 +1223,17 @@ int actor_run(void) {
         return -1;
     }
 
+    /* The main thread is lane 0's first worker. */
     pthread_t workers[ACTOR_MAX_CONCURRENCY];
     int nworkers = 0;
-    for (int i = 1; i < cfg.concurrency; i++) {
-        if (pthread_create(&workers[nworkers], NULL, worker_main, NULL) != 0) {
-            fprintf(stderr, "[actor] could not start worker %d, continuing with %d\n",
-                    i, nworkers + 1);
-            break;
+    for (int li = 0; li < g_nlanes; li++) {
+        for (int k = (li == 0); k < g_lanes[li].concurrency; k++) {
+            if (pthread_create(&workers[nworkers], NULL, worker_main, (void*)(intptr_t)li) != 0) {
+                fprintf(stderr, "[actor] could not start a worker for lane %d\n", li);
+                break;
+            }
+            nworkers++;
         }
-        nworkers++;
     }
 #endif
 
@@ -1139,7 +1241,7 @@ int actor_run(void) {
 #ifdef _WIN32
         heartbeat_tick();
 #endif
-        if (!serve_once()) break;
+        if (!serve_once(0)) break;
     }
 
     fprintf(stderr, "[actor] shutting down\n");
@@ -1150,7 +1252,7 @@ int actor_run(void) {
     pthread_join(reaper, NULL);
 #endif
     nng_close(nng_pub);
-    nng_close(nng_sub);
+    for (int i = 0; i < g_nlanes; i++) nng_close(g_lanes[i].sub);
 #ifndef _WIN32
     nng_close(nng_ctl);
 #endif

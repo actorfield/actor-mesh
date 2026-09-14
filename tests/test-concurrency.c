@@ -606,6 +606,56 @@ static void t_deadline_reaches_handler(void) {
     CHECK(strcmp(without, ":0\n") == 0, "a tuple without a TTL should have deadline 0");
 }
 
+/* ── 11. Lanes ─────────────────────────────────────────────────────────────── */
+
+static void t_lane_does_not_wait(void) {
+    TEST("a topic with its own handler is its own lane, and never waits behind another");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/tc_lane; mkdir -p /tmp/tc_lane");
+    char *a[] = { "./bin/actor", NULL };
+    char *e[] = { "ACTOR_BUS_SUB=" SP, "ACTOR_BUS_PUB=" PP, "ACTOR_HEARTBEAT_MS=0",
+                  "ACTOR_ID=tc", "ACTOR_TOPIC=work,ctl", "ACTOR_RESULT_TOPIC=done",
+                  "ACTOR_HANDLER=sh -c 'sleep 2; echo :slow'", "ACTOR_RETRY_MAX=0",
+                  "ACTOR_HANDLER_ctl=sh -c 'echo :fast'", "ACTOR_RESULT_TOPIC_ctl=ctl_done",
+                  "ACTOR_LMDB_PATH=/tmp/tc_lane", NULL };
+    pid_t ap = sp_(a, e); ms(700);
+    nng_socket ctl  = sub_open("ctl_done");
+    nng_socket done = sub_open("done");
+    sendm("work", "x", 0, 0);
+    ms(300);                                   /* the only default worker is busy */
+    int64_t t0 = now_ms();
+    sendm("ctl", "y", 0, 0);
+    char fast[64] = {0}, slow[64] = {0};
+    int got_ctl = drain_n(ctl, 1500, 1, fast, sizeof fast);
+    int64_t elapsed = now_ms() - t0;
+    int got_done = drain_n(done, 3000, 1, slow, sizeof slow);
+    nng_close(ctl); nng_close(done);
+    stop(pp, ap);
+    printf("  ctl answered in %lldms with %.6s; work gave %.6s\n",
+           (long long)elapsed, fast, slow);
+    CHECK(got_ctl == 1 && strncmp(fast, ":fast", 5) == 0,
+          "ctl was not served by its own handler and result topic");
+    CHECK(elapsed < 1000, "ctl waited behind the busy default lane");
+    CHECK(got_done == 1 && strncmp(slow, ":slow", 5) == 0, "the default lane lost its tuple");
+}
+
+static void t_lanes_overcommit_fails(void) {
+    TEST("lanes asking for more than 32 workers refuse to start");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/tc_lane2; mkdir -p /tmp/tc_lane2");
+    char *a[] = { "./bin/actor", NULL };
+    char *e[] = { "ACTOR_BUS_SUB=" SP, "ACTOR_BUS_PUB=" PP, "ACTOR_HEARTBEAT_MS=0",
+                  "ACTOR_ID=tc", "ACTOR_TOPIC=work,ctl", "ACTOR_RESULT_TOPIC=done",
+                  "ACTOR_HANDLER=sh -c 'echo :ok'", "ACTOR_CONCURRENCY=20",
+                  "ACTOR_CONCURRENCY_ctl=20", "ACTOR_LMDB_PATH=/tmp/tc_lane2", NULL };
+    pid_t ap = sp_(a, e);
+    int gone = wait_exit(ap, 3000);
+    stop(pp, gone ? -1 : ap);
+    CHECK(gone, "an actor whose lanes ask for 40 workers started anyway");
+}
+
 int main(void) {
     printf("actor concurrency tests\n\n");
     t_parallel();
@@ -626,6 +676,8 @@ int main(void) {
     t_heartbeat_lists_running();
     t_deadline_stops_retries();
     t_deadline_reaches_handler();
+    t_lane_does_not_wait();
+    t_lanes_overcommit_fails();
     cleanup();
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED",
            failures, failures == 1 ? "" : "s");

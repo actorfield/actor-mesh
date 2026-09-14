@@ -167,6 +167,11 @@ payload(h : actor_header_t*) : uint8*  ≙  (uint8*)(h + 1)
 │                             ∧ tok = trim(tok) ∧ t = tok }           │
 │ Each subscription uses strlen(t)+1 bytes for exact match            │
 └─────────────────────────────────────────────────────────────────────┘
+
+Lane ≙ { topics ⊆ subscribers, handler, result_topic, concurrency, sub }
+  — a topic with any of ACTOR_{HANDLER,RESULT_TOPIC,CONCURRENCY}_<topic>
+    set gets a lane of its own; the others share one, which is every topic
+    when none is set. Σ lane.concurrency ≤ ACTOR_MAX_CONCURRENCY (32).
 ```
 
 ---
@@ -357,18 +362,16 @@ procedure NngSetup(cfg : ActorConfig) : {0, −1}:
     sleep(1)
   if not connected: return −1
 
-  if nng_sub0_open(&nng_sub) ≠ 0: return −1
-  for i ∈ [0, 30):
-    if nng_dial(nng_sub, cfg.bus_sub_url, ...) = 0: break
-    sleep(1)
-  if not connected: return −1
-
-  for each tok ∈ split(cfg.topic_list, ','):
-    tok ← trim(tok)
-    nng_socket_set(nng_sub, NNG_OPT_SUB_SUBSCRIBE, tok, strlen(tok) + 1)
-    — +1 includes null byte for exact (non-prefix) match
-
-  nng_socket_set_ms(nng_sub, NNG_OPT_RECVTIMEO, 100)
+  for each lane ∈ lanes:                  — one SUB socket per lane (§3.3)
+    if nng_sub0_open(&lane.sub) ≠ 0: return −1
+    for i ∈ [0, 30):
+      if nng_dial(lane.sub, cfg.bus_sub_url, ...) = 0: break
+      sleep(1)
+    if not connected: return −1
+    for each tok ∈ split(lane.topics, ','):
+      nng_socket_set(lane.sub, NNG_OPT_SUB_SUBSCRIBE, tok, strlen(tok) + 1)
+      — +1 includes null byte for exact (non-prefix) match
+    nng_socket_set_ms(lane.sub, NNG_OPT_RECVTIMEO, 100)
   return 0
 ```
 
