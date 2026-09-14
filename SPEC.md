@@ -278,15 +278,17 @@ ParseTopicOverride(buf : uint8*, len : ℕ) : (Topic | null, ℕ)
 ### 6.4 Exit Code Semantics
 
 ```
-RunStatus ::= RUN_OK | RUN_FAILED | RUN_TOO_LARGE
+RunStatus ::= RUN_OK | RUN_FAILED | RUN_TOO_LARGE | RUN_TERMINATED
 
 RUN_OK         ≙ exited 0; result_len bytes are in g_result_buf
                  (result_len = 0: nothing to publish, treated as done)
 RUN_FAILED     ≙ spawn failed, exited non-zero, or killed by a signal
 RUN_TOO_LARGE  ≙ output reached ACTOR_MAX_PAYLOAD
+RUN_TERMINATED ≙ stopped by _term: SIGTERM to its process group, then
+                 SIGKILL after ACTOR_TERM_GRACE_MS
 
 RejectReason ::= payload_cap_exceeded | result_cap_exceeded
-               | max_retries_exceeded | ttl_expired
+               | max_retries_exceeded | ttl_expired | terminated
                — the wire values of a tuple_rejected "reason"
 ```
 
@@ -396,6 +398,10 @@ procedure ProcessTuple(hdr : actor_header_t*, payload : uint8*,
     if run = RUN_TOO_LARGE:
       PublishRejection(hdr, "result_cap_exceeded")
       break  — no retry on overflow
+
+    if run = RUN_TERMINATED:
+      PublishRejection(hdr, "terminated")
+      break  — deliberate: neither retried nor replayed
 
     — RUN_FAILED
     if g_stop: return  — stays in the inbox for the next run (§5.2)

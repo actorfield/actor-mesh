@@ -103,6 +103,7 @@ typedef struct {
     int         heartbeat_ms;
     int         retry_max;
     int         concurrency;
+    int         term_grace_ms;
 } actor_cfg_t;
 
 static actor_cfg_t cfg;
@@ -135,6 +136,10 @@ static int cfg_load(void) {
     const char* rm = getenv("ACTOR_RETRY_MAX");
     cfg.retry_max = rm ? atoi(rm) : 3;
 
+    const char* tg = getenv("ACTOR_TERM_GRACE_MS");
+    cfg.term_grace_ms = tg ? atoi(tg) : 5000;
+    if (cfg.term_grace_ms < 0) cfg.term_grace_ms = 0;
+
     /* Default 1 = the historical single-message-at-a-time behaviour, so an
        existing deployment gets exactly what it had until it opts in. */
     const char* cc = getenv("ACTOR_CONCURRENCY");
@@ -154,6 +159,9 @@ static int cfg_load(void) {
 
 static nng_socket nng_pub;
 static nng_socket nng_sub;
+#ifndef _WIN32
+static nng_socket nng_ctl;   /* control topics, read by the reaper */
+#endif
 static MDB_env*   mdb_env;
 static MDB_dbi    dbi_inbox;
 static MDB_dbi    dbi_outbox;
@@ -226,6 +234,16 @@ static int nng_setup(void) {
 
     /* set recv timeout for heartbeat check granularity (100ms) */
     nng_socket_set_ms(nng_sub, NNG_OPT_RECVTIMEO, 100);
+
+#ifndef _WIN32
+    /* Its own socket, so a _term still arrives when every worker is busy. */
+    if ((rc = nng_sub0_open(&nng_ctl)) != 0 ||
+        (rc = nng_dial(nng_ctl, cfg.bus_sub, NULL, 0)) != 0 ||
+        (rc = nng_socket_set(nng_ctl, NNG_OPT_SUB_SUBSCRIBE, "_term", sizeof("_term"))) != 0) {
+        fprintf(stderr, "[actor] control socket: %s\n", nng_strerror(rc));
+        return -1;
+    }
+#endif
 
     return 0;
 }
@@ -317,6 +335,7 @@ typedef enum {
     RUN_OK,         /* exited 0; *out_len bytes of output are in out */
     RUN_FAILED,     /* could not start, exited non-zero, or was killed */
     RUN_TOO_LARGE,  /* output exceeded ACTOR_MAX_PAYLOAD */
+    RUN_TERMINATED, /* stopped by _term */
 } run_status_t;
 
 /* platform_spawn launches the handler, pipes payload to its stdin,
@@ -326,7 +345,9 @@ typedef enum {
 
 static run_status_t platform_spawn(const uint8_t* in,  size_t in_len,
                                    uint8_t*       out, size_t out_cap,
-                                   const child_env_t* env, size_t* out_len) {
+                                   const child_env_t* env, const actor_header_t* hdr,
+                                   size_t* out_len) {
+    (void)hdr;   /* _term is Unix-only: it needs process groups */
     /* Windows runs a single worker (cfg_load clamps concurrency to 1 there),
        so mutating the process environment before CreateProcess is safe. */
     SetEnvironmentVariableA("ACTOR_TUPLE_ID",       env->id_hex);
@@ -430,9 +451,13 @@ fail_stdin:
  */
 
 typedef struct {
-    pid_t pid;      /* 0 = free slot                        */
-    int   status;   /* raw waitpid status, valid when done  */
-    int   done;     /* set by the reaper                    */
+    pid_t   pid;                 /* 0 = free slot; also its process group */
+    int     status;              /* raw waitpid status, valid when done   */
+    int     done;                /* set by the reaper                     */
+    uint8_t tuple_id[16];        /* what it is running, for _term         */
+    uint8_t correlation_id[16];
+    bool    terminated;          /* _term has sent SIGTERM                */
+    int64_t kill_at_ms;          /* SIGKILL deadline, 0 = none            */
 } child_slot_t;
 
 static child_slot_t   g_children[ACTOR_MAX_CONCURRENCY];
@@ -440,10 +465,66 @@ static pthread_mutex_t child_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  child_cv = PTHREAD_COND_INITIALIZER;
 static atomic_int      g_reaper_stop;   /* set once every worker has returned */
 
+static int64_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
+static bool id_is_zero(const uint8_t id[16]) {
+    for (int i = 0; i < 16; i++) if (id[i]) return false;
+    return true;
+}
+
+/* _term: SIGTERM the process group of every running handler in the named
+   correlation chain -- or only the named tuple, when causation_id is set --
+   and leave escalate_kills to SIGKILL what remains after the grace. */
+static void term_matching(const actor_header_t* req) {
+    if (id_is_zero(req->correlation_id)) return;
+    bool one = !id_is_zero(req->causation_id);
+    pthread_mutex_lock(&child_mu);
+    for (int i = 0; i < ACTOR_MAX_CONCURRENCY; i++) {
+        child_slot_t* c = &g_children[i];
+        if (!c->pid || c->done || c->terminated) continue;
+        if (memcmp(c->correlation_id, req->correlation_id, 16) != 0) continue;
+        if (one && memcmp(c->tuple_id, req->causation_id, 16) != 0) continue;
+        kill(-c->pid, SIGTERM);
+        c->terminated = true;
+        c->kill_at_ms = mono_ms() + cfg.term_grace_ms;
+    }
+    pthread_mutex_unlock(&child_mu);
+}
+
+/* Only the header matters, so a fixed buffer is enough: nng_recv copies what
+   fits and reports the full length. */
+static void control_poll(void) {
+    uint8_t buf[sizeof(actor_header_t)];
+    size_t  sz = sizeof(buf);
+    while (nng_recv(nng_ctl, buf, &sz, NNG_FLAG_NONBLOCK) == 0) {
+        if (sz >= sizeof(actor_header_t)) term_matching((const actor_header_t*)buf);
+        sz = sizeof(buf);
+    }
+}
+
+static void escalate_kills(void) {
+    int64_t now = mono_ms();
+    pthread_mutex_lock(&child_mu);
+    for (int i = 0; i < ACTOR_MAX_CONCURRENCY; i++) {
+        child_slot_t* c = &g_children[i];
+        if (c->pid && !c->done && c->kill_at_ms && now >= c->kill_at_ms) {
+            kill(-c->pid, SIGKILL);
+            c->kill_at_ms = 0;
+        }
+    }
+    pthread_mutex_unlock(&child_mu);
+}
+
 /* Reaper thread: the only caller of waitpid in the process. */
 static void* reaper_main(void* arg) {
     (void)arg;
     while (!atomic_load(&g_reaper_stop)) {
+        control_poll();
+        escalate_kills();
         int   status;
         pid_t pid = waitpid(-1, &status, WNOHANG);
         if (pid <= 0) {
@@ -470,23 +551,33 @@ static void* reaper_main(void* arg) {
     return NULL;
 }
 
-/* Block until the reaper reports `slot`'s child, then free the slot.
-   Returns the raw waitpid status. */
-static int await_child(int slot) {
+typedef struct {
+    int  status;       /* raw waitpid status */
+    bool terminated;   /* stopped by _term   */
+} child_exit_t;
+
+/* Block until the reaper reports `slot`'s child, then free the slot. */
+static child_exit_t await_child(int slot) {
     pthread_mutex_lock(&child_mu);
     /* The reaper outlives every worker, so this always gets an answer. */
     while (!g_children[slot].done)
         pthread_cond_wait(&child_cv, &child_mu);
-    int status = g_children[slot].status;
-    g_children[slot].pid  = 0;
-    g_children[slot].done = 0;
+    child_slot_t* c = &g_children[slot];
+    child_exit_t  e = { c->status, c->terminated };
+    /* A terminated handler's leftovers go with it. */
+    if (c->terminated) kill(-c->pid, SIGKILL);
+    c->pid        = 0;
+    c->done       = 0;
+    c->terminated = false;
+    c->kill_at_ms = 0;
     pthread_mutex_unlock(&child_mu);
-    return status;
+    return e;
 }
 
 static run_status_t platform_spawn(const uint8_t* in,  size_t in_len,
                                    uint8_t*       out, size_t out_cap,
-                                   const child_env_t* env, size_t* out_len) {
+                                   const child_env_t* env, const actor_header_t* hdr,
+                                   size_t* out_len) {
     int to_child[2], from_child[2];
 
     if (pipe(to_child)   < 0) return RUN_FAILED;
@@ -517,6 +608,9 @@ static run_status_t platform_spawn(const uint8_t* in,  size_t in_len,
     }
 
     if (pid == 0) {
+        /* Its own process group, so _term can signal the whole tree. */
+        setpgid(0, 0);
+
         /* Child. setenv happens HERE, after the fork, not in the parent before
            it: the parent may be several worker threads deep, and setenv mutates
            process-wide state, so stamping the environment in the parent would
@@ -548,9 +642,13 @@ static run_status_t platform_spawn(const uint8_t* in,  size_t in_len,
         _exit(1);
     }
 
-    g_children[slot].pid    = pid;
-    g_children[slot].done   = 0;
-    g_children[slot].status = 0;
+    setpgid(pid, pid);   /* the child does the same; whichever runs first wins */
+    child_slot_t* c = &g_children[slot];
+    c->pid    = pid;
+    c->done   = 0;
+    c->status = 0;
+    memcpy(c->tuple_id,       hdr->id,             16);
+    memcpy(c->correlation_id, hdr->correlation_id, 16);
     pthread_mutex_unlock(&child_mu);
 
     close(to_child[0]);
@@ -580,8 +678,9 @@ static run_status_t platform_spawn(const uint8_t* in,  size_t in_len,
     }
     close(from_child[0]);
 
-    int status = await_child(slot);
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return RUN_FAILED;
+    child_exit_t e = await_child(slot);
+    if (e.terminated) return RUN_TERMINATED;
+    if (!WIFEXITED(e.status) || WEXITSTATUS(e.status) != 0) return RUN_FAILED;
 
     *out_len = len;
     return RUN_OK;
@@ -607,7 +706,7 @@ static run_status_t invoke_handler(const actor_header_t* hdr,
     snprintf(env.topic,   sizeof(env.topic),   "%.*s", 32, hdr->topic);
 
     return platform_spawn(payload, payload_len, g_result_buf, ACTOR_MAX_PAYLOAD, &env,
-                          result_len);
+                          hdr, result_len);
 }
 
 /* ── Publish ─────────────────────────────────────────────────────────────── */
@@ -683,6 +782,7 @@ typedef enum {
     REJECT_RESULT_CAP_EXCEEDED,
     REJECT_MAX_RETRIES_EXCEEDED,
     REJECT_TTL_EXPIRED,
+    REJECT_TERMINATED,
 } reject_reason_t;
 
 static const char* const reject_names[] = {
@@ -690,6 +790,7 @@ static const char* const reject_names[] = {
     [REJECT_RESULT_CAP_EXCEEDED]  = "result_cap_exceeded",
     [REJECT_MAX_RETRIES_EXCEEDED] = "max_retries_exceeded",
     [REJECT_TTL_EXPIRED]          = "ttl_expired",
+    [REJECT_TERMINATED]           = "terminated",
 };
 
 static void publish_rejection(const actor_header_t* in_hdr, reject_reason_t why) {
@@ -786,6 +887,11 @@ static void process_tuple(const actor_header_t* hdr,
         if (run == RUN_TOO_LARGE) {
             /* no point retrying */
             publish_rejection(hdr, REJECT_RESULT_CAP_EXCEEDED);
+            break;
+        }
+        if (run == RUN_TERMINATED) {
+            /* deliberate: neither retried nor replayed */
+            publish_rejection(hdr, REJECT_TERMINATED);
             break;
         }
 
@@ -998,6 +1104,9 @@ int actor_run(void) {
 #endif
     nng_close(nng_pub);
     nng_close(nng_sub);
+#ifndef _WIN32
+    nng_close(nng_ctl);
+#endif
     mdb_env_close(mdb_env);
     return 0;
 }

@@ -400,6 +400,30 @@ Payload cap exceeded → drop immediately, no retry.
 
 ---
 
+## Remote control
+
+A message starts a handler; `_term` is the message that stops one.
+
+Every actor subscribes to `_term`. The header names the target, so the
+runtime still never reads a payload:
+
+- `correlation_id` — the chain to stop. Required; all-zero is ignored.
+- `causation_id` — if non-zero, only the tuple with that id.
+
+Each handler leads its own process group. On `_term` the actor sends
+SIGTERM to the group of every matching handler, and SIGKILL to whatever is
+left after `ACTOR_TERM_GRACE_MS`. The SIGKILL is what guarantees the stop:
+the init of a PID namespace ignores SIGTERM from outside unless it handles
+it. The tuple is reported as `tuple_rejected` with reason `terminated`, and
+is neither retried nor replayed.
+
+`_term` is read by the thread that reaps handlers, not by the workers, so it
+arrives even when every worker is busy. It stops what is running; a tuple
+still queued or waiting between retries is not affected. Anyone who can
+publish to the bus can send one — the same trust as any other publish.
+
+---
+
 ## Configuration
 
 | Variable | Required | Default | Description |
@@ -415,6 +439,7 @@ Payload cap exceeded → drop immediately, no retry.
 | `ACTOR_HEARTBEAT_MS` | ☐ | 5000 | Heartbeat interval ms |
 | `ACTOR_RETRY_MAX` | ☐ | 3 | Max handler retries |
 | `ACTOR_CONCURRENCY` | ☐ | 1 | Messages in flight at once (max 32) |
+| `ACTOR_TERM_GRACE_MS` | ☐ | 5000 | SIGTERM to SIGKILL grace for `_term` (Unix) |
 
 Isolation (Linux, all optional — see [Isolation](#isolation)):
 

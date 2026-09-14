@@ -53,13 +53,16 @@ static int64_t now_ms(void) {
 }
 
 /* Build and publish a frame. ttl_ns 0 = no expiry. */
+/* chain, when non-zero, fills the tuple id and correlation id with that byte. */
 static void sendm_as(const char *origin, const char *topic, const char *payload,
-                     int64_t ttl_ns, int64_t emitted_override) {
+                     int64_t ttl_ns, int64_t emitted_override, uint8_t chain) {
     nng_socket s; nng_pub0_open(&s); nng_dial(s, PP, NULL, 0); ms(60);
     size_t pl = strlen(payload);
     uint8_t f[1024] = {0};
     size_t tl = strlen(topic); if (tl > 31) tl = 31;
     memcpy(f, topic, tl);
+    memset(f + 32, chain, 16);                       /* id          */
+    memset(f + 48, chain, 16);                       /* correlation */
     memcpy(f + 80, origin, strnlen(origin, 32));     /* origin */
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
     int64_t ns = emitted_override ? emitted_override
@@ -74,7 +77,7 @@ static void sendm_as(const char *origin, const char *topic, const char *payload,
 }
 
 static void sendm(const char *topic, const char *payload, int64_t ttl_ns, int64_t emitted_override) {
-    sendm_as("test", topic, payload, ttl_ns, emitted_override);
+    sendm_as("test", topic, payload, ttl_ns, emitted_override, 0);
 }
 
 /* Subscribers must exist BEFORE anything is published — this is pub/sub, so a
@@ -133,7 +136,7 @@ static pid_t spawn_actor(const char *handler, const char *conc, const char *retr
     char *a[] = { "./bin/actor", NULL };
     char *e[] = { "ACTOR_BUS_SUB=" SP, "ACTOR_BUS_PUB=" PP, "ACTOR_HEARTBEAT_MS=0",
                   "ACTOR_ID=tc", "ACTOR_TOPIC=work", "ACTOR_RESULT_TOPIC=done",
-                  h, c, r, d, NULL };
+                  "ACTOR_TERM_GRACE_MS=500", h, c, r, d, NULL };
     pid_t p = sp_(a, e); ms(700); return p;
 }
 
@@ -418,7 +421,7 @@ static void t_rejection_bounds_origin(void) {
     int64_t old = (ts.tv_sec - 10) * 1000000000LL + ts.tv_nsec;
     nng_socket rej = sub_open("tuple_rejected");
     /* 32 bytes, no terminator, one quote; expired so it is rejected on arrival */
-    sendm_as("ab\"cdefghijklmnopqrstuvwxyz01234", "work", "x", 1000000000LL, old);
+    sendm_as("ab\"cdefghijklmnopqrstuvwxyz01234", "work", "x", 1000000000LL, old, 0);
     char body[512] = {0};
     drain_n(rej, 3000, 1, body, sizeof body);
     nng_close(rej);
@@ -426,6 +429,94 @@ static void t_rejection_bounds_origin(void) {
     printf("  %.200s\n", body);
     CHECK(strstr(body, "\"origin\":\"ab?cdefghijklmnopqrstuvwxyz01234\",\"topic\":\"work\"") != NULL,
           "origin ran past its field or broke the JSON");
+}
+
+/* ── 8. Remote terminate ─────────────────────────────────────────────────── */
+
+/* How many processes have exactly these args. */
+static int procs_named(const char *args) {
+    char cmd[256];
+    snprintf(cmd, sizeof cmd, "ps -eo args | grep -cx '%s'", args);
+    FILE *f = popen(cmd, "r");
+    int n = -1;
+    if (f) { if (fscanf(f, "%d", &n) != 1) n = -1; pclose(f); }
+    return n;
+}
+
+static void t_term_stops_the_group(void) {
+    TEST("_term stops a handler and all it started, with every worker busy");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -f /tmp/tc_term_log");
+    pid_t ap = start_actor("sh -c 'echo $ACTOR_ATTEMPT >> /tmp/tc_term_log; sleep 31 & sleep 31'",
+                           "1", "3", "/tmp/tc_term");
+    nng_socket rej  = sub_open("tuple_rejected");
+    nng_socket done = sub_open("done");
+    sendm_as("test", "work", "x", 0, 0, 0x11);
+    ms(500);
+    int before = procs_named("sleep 31");
+    int64_t t0 = now_ms();
+    sendm_as("test", "_term", "", 0, 0, 0x11);
+    char reason[512] = {0};
+    int rejected = drain_n(rej, 3000, 1, reason, sizeof reason);
+    int64_t elapsed = now_ms() - t0;
+    ms(300);
+    int after = procs_named("sleep 31");
+    int results = drain(done, 300, NULL, 0);
+    nng_close(rej); nng_close(done);
+    stop(pp, ap);
+    system("pkill -9 -x sleep 2>/dev/null");
+    char log[64]; slurp("/tmp/tc_term_log", log, sizeof log);
+    printf("  sleeps %d -> %d, rejected=%d in %lldms, results=%d, attempts=[%s]\n",
+           before, after, rejected, (long long)elapsed, results, log);
+    CHECK(before == 2 && after == 0, "the handler's process group outlived _term");
+    CHECK(rejected == 1 && strstr(reason, "\"reason\":\"terminated\"") != NULL,
+          "not reported as terminated");
+    CHECK(elapsed < 500, "SIGTERM alone should have been enough");
+    CHECK(results == 0 && strcmp(log, "0 ") == 0, "a terminated tuple was retried or published");
+}
+
+static void t_term_escalates_to_kill(void) {
+    TEST("a handler that ignores SIGTERM is killed after ACTOR_TERM_GRACE_MS");
+    cleanup();
+    pid_t pp = start_proxy();
+    pid_t ap = start_actor("sh -c 'trap \"\" TERM; sleep 32'", "1", "0", "/tmp/tc_kill");
+    nng_socket rej = sub_open("tuple_rejected");
+    sendm_as("test", "work", "x", 0, 0, 0x12);
+    ms(500);
+    int64_t t0 = now_ms();
+    sendm_as("test", "_term", "", 0, 0, 0x12);
+    char reason[512] = {0};
+    int rejected = drain_n(rej, 4000, 1, reason, sizeof reason);
+    int64_t elapsed = now_ms() - t0;
+    ms(200);
+    int left = procs_named("sleep 32");
+    nng_close(rej);
+    stop(pp, ap);
+    system("pkill -9 -x sleep 2>/dev/null");
+    printf("  rejected=%d in %lldms, left=%d\n", rejected, (long long)elapsed, left);
+    CHECK(rejected == 1 && strstr(reason, "terminated") != NULL, "not reported as terminated");
+    CHECK(elapsed >= 500 && elapsed < 2000, "SIGKILL did not follow the 500ms grace");
+    CHECK(left == 0, "a process survived SIGKILL");
+}
+
+static void t_term_names_its_target(void) {
+    TEST("_term for another chain, or for no chain, leaves a running tuple alone");
+    cleanup();
+    pid_t pp = start_proxy();
+    pid_t ap = start_actor("sh -c 'sleep 1; echo :ok'", "2", "0", "/tmp/tc_other");
+    nng_socket rej  = sub_open("tuple_rejected");
+    nng_socket done = sub_open("done");
+    sendm("work", "x", 0, 0);                    /* correlation all zero */
+    ms(300);
+    sendm_as("test", "_term", "", 0, 0, 0x22);   /* a chain that is not running */
+    sendm_as("test", "_term", "", 0, 0, 0x00);   /* names no chain: ignored */
+    int results  = drain_n(done, 3000, 1, NULL, 0);
+    int rejected = drain(rej, 300, NULL, 0);
+    nng_close(rej); nng_close(done);
+    stop(pp, ap);
+    printf("  results=%d rejected=%d\n", results, rejected);
+    CHECK(results == 1 && rejected == 0, "a _term reached a tuple it did not name");
 }
 
 int main(void) {
@@ -442,6 +533,9 @@ int main(void) {
     t_replay_after_crash();
     t_stop_leaves_unfinished();
     t_rejection_bounds_origin();
+    t_term_stops_the_group();
+    t_term_escalates_to_kill();
+    t_term_names_its_target();
     cleanup();
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED",
            failures, failures == 1 ? "" : "s");
