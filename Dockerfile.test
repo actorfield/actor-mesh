@@ -1,10 +1,14 @@
 # Mirrors Dockerfile.actor's base and deps, plus what the tests need.
 FROM alpine:3.24
-RUN apk add --no-cache gcc musl-dev nng-dev lmdb-dev iproute2 procps
+RUN apk add --no-cache gcc musl-dev nng-dev lmdb-dev make iproute2 procps
 WORKDIR /src
 COPY runtime/ /src/runtime/
 COPY proxy/   /src/proxy/
 COPY tests/   /src/tests/
+# test-mesh's registry test runs the example tool registry and its mpack-get
+COPY vendor/mpack/ /src/vendor/mpack/
+COPY examples/employee-mesh/Makefile  /src/examples/employee-mesh/
+COPY examples/employee-mesh/handlers/ /src/examples/employee-mesh/handlers/
 RUN mkdir -p bin && \
     gcc -Wall -Wextra -O2 -std=c11 -Iruntime \
         runtime/main.c runtime/actor.c runtime/actor_isolation.c \
@@ -12,5 +16,6 @@ RUN mkdir -p bin && \
     gcc -Wall -Wextra -O2 -std=c11 -Iruntime proxy/proxy.c -lnng -llmdb -o bin/mesh-proxy && \
     gcc -Wall -Wextra -O2 -std=c11 -Iruntime tests/test-isolation.c -lnng -o bin/test-isolation && \
     gcc -Wall -Wextra -O2 -std=c11 tests/test-concurrency.c -lnng -o bin/test-concurrency && \
-    gcc -Wall -Wextra -O2 -std=c11 tests/test-mesh.c -lnng -o bin/test-mesh
+    gcc -Wall -Wextra -O2 -std=c11 tests/test-mesh.c -lnng -o bin/test-mesh && \
+    make -B -C examples/employee-mesh handlers/lib/mpack-get
 CMD ["/bin/sh"]

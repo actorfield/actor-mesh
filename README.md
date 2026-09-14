@@ -86,8 +86,7 @@ ACTOR_BUS_PUB=tcp://127.0.0.1:5557 \
 ## Tests
 
 ```sh
-gcc -Wall -O2 -std=c11 tests/test-mesh.c -lnng -o bin/test-mesh
-./bin/test-mesh              # 10/10 — proxy, actor, handler contract, TTL
+make test-mesh               # 10/10 — proxy, actor, handler contract, TTL, registry
 
 make test-concurrency        # ACTOR_CONCURRENCY and child reaping
 make test-isolation          # ACTOR_* confinement (Linux)

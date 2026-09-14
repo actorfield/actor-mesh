@@ -42,7 +42,7 @@ static void sendm(const char *topic, const uint8_t *p, size_t pl) {
     memcpy(f, topic, tl); memcpy(f+80, "test", 4);
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
     int64_t ns=ts.tv_sec*1000000000LL+ts.tv_nsec;
-    memcpy(f+112, &ns, 8); uint32_t pl2=pl; memcpy(f+138, &pl2, 4);
+    memcpy(f+112, &ns, 8); uint32_t pl2=pl; memcpy(f+132, &pl2, 4);
     memcpy(f+256, p, pl); nng_send(s, f, 256+pl, 0); nng_close(s);
 }
 

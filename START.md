@@ -34,8 +34,7 @@ bash test-mcp-mesh.sh "how many employees?"
 ## Run the tests
 
 ```sh
-gcc -Wall -O2 -std=c11 tests/test-mesh.c -lnng -o bin/test-mesh
-bin/test-mesh           # 10/10 unit tests
+make test-mesh          # 10/10 unit tests
 
 make test-concurrency   # ACTOR_CONCURRENCY + child reaping
 make test-isolation     # ACTOR_* confinement (Linux; skips what the host lacks)
