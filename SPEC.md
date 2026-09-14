@@ -278,17 +278,16 @@ ParseTopicOverride(buf : uint8*, len : ℕ) : (Topic | null, ℕ)
 ### 6.4 Exit Code Semantics
 
 ```
-predicate HandlerSuccess(result_len : ℤ) ≙
-  result_len > 0
+RunStatus ::= RUN_OK | RUN_FAILED | RUN_TOO_LARGE
 
-predicate HandlerEmpty(result_len : ℤ) ≙
-  result_len = 0
+RUN_OK         ≙ exited 0; result_len bytes are in g_result_buf
+                 (result_len = 0: nothing to publish, treated as done)
+RUN_FAILED     ≙ spawn failed, exited non-zero, or killed by a signal
+RUN_TOO_LARGE  ≙ output reached ACTOR_MAX_PAYLOAD
 
-predicate HandlerOverflow(result_len : ℤ) ≙
-  result_len = −2
-
-predicate HandlerFailure(result_len : ℤ) ≙
-  result_len < 0  ∧  result_len ≠ −2
+RejectReason ::= payload_cap_exceeded | result_cap_exceeded
+               | max_retries_exceeded | ttl_expired
+               — the wire values of a tuple_rejected "reason"
 ```
 
 ---
@@ -388,20 +387,18 @@ procedure ProcessTuple(hdr : actor_header_t*, payload : uint8*,
 
   attempt ← 0
   while attempt ≤ cfg.retry_max:
-    result_len ← InvokeHandler(hdr, payload, plen)
+    (run, result_len) ← InvokeHandler(hdr, payload, plen, hdr.attempt + attempt)
 
-    if HandlerSuccess(result_len):
-      PublishResult(hdr, result_len)
+    if run = RUN_OK:
+      if result_len > 0: PublishResult(hdr, result_len)
       break
 
-    if HandlerEmpty(result_len):
-      break  — nothing to publish, treat as done
-
-    if HandlerOverflow(result_len):
+    if run = RUN_TOO_LARGE:
       PublishRejection(hdr, "result_cap_exceeded")
       break  — no retry on overflow
 
-    — handler failure
+    — RUN_FAILED
+    if g_stop: return  — stays in the inbox for the next run (§5.2)
     attempt ← attempt + 1
     if attempt > cfg.retry_max:
       PublishRejection(hdr, "max_retries_exceeded")
@@ -417,13 +414,12 @@ procedure ProcessTuple(hdr : actor_header_t*, payload : uint8*,
 
 ```
 procedure InvokeHandler(hdr : actor_header_t*, payload : uint8*,
-                        plen : ℕ) : ℤ:
-  { post: result ∈ {−2, −1, 0} ∪ [1, ACTOR_MAX_PAYLOAD]           }
+                        plen : ℕ, attempt : ℕ) : (RunStatus, ℕ):
+  { post: result_len ≤ ACTOR_MAX_PAYLOAD                          }
 
-  SetHeaderEnvVars(hdr)    — §6.2
+  SetHeaderEnvVars(hdr, attempt)    — §6.2
 
-  result_len ← PlatformSpawn(payload, plen, g_result_buf, ACTOR_MAX_PAYLOAD)
-  return result_len
+  return PlatformSpawn(payload, plen, g_result_buf, ACTOR_MAX_PAYLOAD)
 ```
 
 ### 7.5 PublishResult
@@ -530,7 +526,7 @@ procedure proxy_main():
 
 ```
 procedure PlatformSpawn(stdin_data : uint8*, in_len : ℕ,
-                        stdout_buf : uint8*, out_cap : ℕ) : ℤ:
+                        stdout_buf : uint8*, out_cap : ℕ) : (RunStatus, ℕ):
   { pre:  out_cap = ACTOR_MAX_PAYLOAD                                 }
 
   — Unix path
@@ -558,14 +554,14 @@ procedure PlatformSpawn(stdin_data : uint8*, in_len : ℕ,
       drain remaining bytes   — read and discard until EOF
       close(from_child[0])
       waitpid(pid, ...)
-      return −2               — overflow
+      return (RUN_TOO_LARGE, 0)
 
   close(from_child[0])
   waitpid(pid, &status, 0)
 
-  if WIFEXITED(status) ∧ WEXITSTATUS(status) ≠ 0:
-    return −1                  — handler error
-  return len
+  if ¬WIFEXITED(status) ∨ WEXITSTATUS(status) ≠ 0:
+    return (RUN_FAILED, 0)     — handler error or signal
+  return (RUN_OK, len)
 ```
 
 ---
@@ -605,19 +601,19 @@ predicate PayloadAcceptable(plen : ℕ) ≙
 ### 8.4 Result Valid
 
 ```
-predicate ResultAcceptable(result_len : ℤ) ≙
-  −2 ≤ result_len ≤ ACTOR_MAX_PAYLOAD
-  ∧ (result_len > 0  ⇒  handler wrote valid output)
-  ∧ (result_len = 0  ⇒  handler wrote nothing — treat as success)
-  ∧ (result_len = −1 ⇒  handler exited non-zero or spawn failed)
-  ∧ (result_len = −2 ⇒  handler output exceeded ACTOR_MAX_PAYLOAD)
+predicate ResultAcceptable(run : RunStatus, result_len : ℕ) ≙
+  result_len ≤ ACTOR_MAX_PAYLOAD
+  ∧ (run = RUN_OK        ⇒  handler exited 0; result_len = 0 means nothing to publish)
+  ∧ (run = RUN_FAILED    ⇒  handler exited non-zero, was signalled, or spawn failed)
+  ∧ (run = RUN_TOO_LARGE ⇒  handler output reached ACTOR_MAX_PAYLOAD)
 ```
 
 ### 8.5 Retry Deserves
 
 ```
-predicate RetryWarranted(result_len : ℤ, attempt : ℕ, retry_max : ℕ₀) ≙
-  result_len = −1                    — handler failure
+predicate RetryWarranted(run : RunStatus, attempt : ℕ, retry_max : ℕ₀) ≙
+  run = RUN_FAILED                   — handler failure
+  ∧ ¬g_stop                          — never while stopping
   ∧ attempt ≤ retry_max             — retries remaining
 ```
 

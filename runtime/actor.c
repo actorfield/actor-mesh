@@ -312,14 +312,21 @@ typedef struct {
     char topic[33];
 } child_env_t;
 
+/* How one handler run ended. */
+typedef enum {
+    RUN_OK,         /* exited 0; *out_len bytes of output are in out */
+    RUN_FAILED,     /* could not start, exited non-zero, or was killed */
+    RUN_TOO_LARGE,  /* output exceeded ACTOR_MAX_PAYLOAD */
+} run_status_t;
+
 /* platform_spawn launches the handler, pipes payload to its stdin,
- * reads result from its stdout, returns the length or error.
+ * reads its stdout into out, and says how the run ended.
  * Unix: fork/exec   Windows: CreateProcess */
 #ifdef _WIN32
 
-static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
-                              uint8_t*       out, size_t out_cap,
-                              const child_env_t* env) {
+static run_status_t platform_spawn(const uint8_t* in,  size_t in_len,
+                                   uint8_t*       out, size_t out_cap,
+                                   const child_env_t* env, size_t* out_len) {
     /* Windows runs a single worker (cfg_load clamps concurrency to 1 there),
        so mutating the process environment before CreateProcess is safe. */
     SetEnvironmentVariableA("ACTOR_TUPLE_ID",       env->id_hex);
@@ -331,9 +338,9 @@ static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
     HANDLE stdin_rd  = NULL, stdin_wr  = NULL;
     HANDLE stdout_rd = NULL, stdout_wr = NULL;
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
-    ssize_t result = -1;
+    run_status_t result = RUN_FAILED;
 
-    if (!CreatePipe(&stdin_rd,  &stdin_wr,  &sa, 0)) return -1;
+    if (!CreatePipe(&stdin_rd,  &stdin_wr,  &sa, 0)) return RUN_FAILED;
     if (!CreatePipe(&stdout_rd, &stdout_wr, &sa, 0)) goto fail_stdin;
     SetHandleInformation(stdin_wr,  HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(stdout_rd, HANDLE_FLAG_INHERIT, 0);
@@ -369,15 +376,16 @@ static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
         if (len == out_cap) {
             uint8_t drain[256]; DWORD d;
             while (ReadFile(stdout_rd, drain, sizeof(drain), &d, NULL) && d > 0) {}
-            result = -2;
+            result = RUN_TOO_LARGE;
             goto fail_proc;
         }
     }
-    result = (ssize_t)len;
+    *out_len = len;
+    result = RUN_OK;
 
     WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD ec;
-    if (GetExitCodeProcess(pi.hProcess, &ec) && ec != 0) result = -1;
+    if (GetExitCodeProcess(pi.hProcess, &ec) && ec != 0) result = RUN_FAILED;
 
 fail_proc:
     CloseHandle(pi.hProcess);
@@ -475,13 +483,13 @@ static int await_child(int slot) {
     return status;
 }
 
-static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
-                              uint8_t*       out, size_t out_cap,
-                              const child_env_t* env) {
+static run_status_t platform_spawn(const uint8_t* in,  size_t in_len,
+                                   uint8_t*       out, size_t out_cap,
+                                   const child_env_t* env, size_t* out_len) {
     int to_child[2], from_child[2];
 
-    if (pipe(to_child)   < 0) return -1;
-    if (pipe(from_child) < 0) { close(to_child[0]); close(to_child[1]); return -1; }
+    if (pipe(to_child)   < 0) return RUN_FAILED;
+    if (pipe(from_child) < 0) { close(to_child[0]); close(to_child[1]); return RUN_FAILED; }
 
     /* Claim a slot, then fork and register the pid without releasing the
        mutex -- see the dispatcher note above for why the two must be atomic
@@ -496,7 +504,7 @@ static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
         close(to_child[0]); close(to_child[1]);
         close(from_child[0]); close(from_child[1]);
         fprintf(stderr, "[actor] no free child slot (concurrency=%d)\n", cfg.concurrency);
-        return -1;
+        return RUN_FAILED;
     }
 
     pid_t pid = fork();
@@ -504,7 +512,7 @@ static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
         pthread_mutex_unlock(&child_mu);
         close(to_child[0]); close(to_child[1]);
         close(from_child[0]); close(from_child[1]);
-        return -1;
+        return RUN_FAILED;
     }
 
     if (pid == 0) {
@@ -551,7 +559,7 @@ static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
         close(to_child[1]);
         close(from_child[0]);
         await_child(slot);
-        return -1;
+        return RUN_FAILED;
     }
     close(to_child[1]);
 
@@ -566,28 +574,29 @@ static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
             await_child(slot);
             fprintf(stderr, "[actor] result exceeded ACTOR_MAX_PAYLOAD=%d, dropping\n",
                     ACTOR_MAX_PAYLOAD);
-            return -2;
+            return RUN_TOO_LARGE;
         }
     }
     close(from_child[0]);
 
     int status = await_child(slot);
-    if (WIFEXITED(status) && WEXITSTATUS(status) != 0) return -1;
-    if (!WIFEXITED(status)) return -1;                  /* signalled — not a success */
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return RUN_FAILED;
 
-    return (ssize_t)len;
+    *out_len = len;
+    return RUN_OK;
 }
 
 #endif /* _WIN32 */
 
-/* invoke_handler: collect the per-message env, spawn handler, return result
- * length. The values travel as a value into platform_spawn, which applies them
+/* invoke_handler: collect the per-message env and spawn the handler. The
+ * values travel as a value into platform_spawn, which applies them
  * where it is safe to do so for the platform (in the forked child on Unix, on
  * the parent before CreateProcess on Windows). */
-static ssize_t invoke_handler(const actor_header_t* hdr,
-                              const uint8_t*        payload,
-                              size_t                payload_len,
-                              int                   attempt) {
+static run_status_t invoke_handler(const actor_header_t* hdr,
+                                   const uint8_t*        payload,
+                                   size_t                payload_len,
+                                   int                   attempt,
+                                   size_t*               result_len) {
     child_env_t env;
     actor_uuid_hex(hdr->id,             env.id_hex);
     actor_uuid_hex(hdr->correlation_id, env.corr_hex);
@@ -596,7 +605,8 @@ static ssize_t invoke_handler(const actor_header_t* hdr,
     snprintf(env.attempt, sizeof(env.attempt), "%d", attempt);
     snprintf(env.topic,   sizeof(env.topic),   "%.*s", 32, hdr->topic);
 
-    return platform_spawn(payload, payload_len, g_result_buf, ACTOR_MAX_PAYLOAD, &env);
+    return platform_spawn(payload, payload_len, g_result_buf, ACTOR_MAX_PAYLOAD, &env,
+                          result_len);
 }
 
 /* ── Publish ─────────────────────────────────────────────────────────────── */
@@ -666,7 +676,23 @@ static void publish_result(const actor_header_t* in_hdr, size_t result_len) {
 
 /* ── Rejection ───────────────────────────────────────────────────────────── */
 
-static void publish_rejection(const actor_header_t* in_hdr, const char* reason) {
+/* Why a tuple was rejected; the names are the wire values of "reason". */
+typedef enum {
+    REJECT_PAYLOAD_CAP_EXCEEDED,
+    REJECT_RESULT_CAP_EXCEEDED,
+    REJECT_MAX_RETRIES_EXCEEDED,
+    REJECT_TTL_EXPIRED,
+} reject_reason_t;
+
+static const char* const reject_names[] = {
+    [REJECT_PAYLOAD_CAP_EXCEEDED] = "payload_cap_exceeded",
+    [REJECT_RESULT_CAP_EXCEEDED]  = "result_cap_exceeded",
+    [REJECT_MAX_RETRIES_EXCEEDED] = "max_retries_exceeded",
+    [REJECT_TTL_EXPIRED]          = "ttl_expired",
+};
+
+static void publish_rejection(const actor_header_t* in_hdr, reject_reason_t why) {
+    const char* reason = reject_names[why];
     char   id_hex[33], corr_hex[33];
     actor_uuid_hex(in_hdr->id,             id_hex);
     actor_uuid_hex(in_hdr->correlation_id, corr_hex);
@@ -729,7 +755,7 @@ static void process_tuple(const actor_header_t* hdr,
                           tuple_source_t        source) {
     /* hard cap on incoming payload */
     if (payload_len > ACTOR_MAX_PAYLOAD) {
-        publish_rejection(hdr, "payload_cap_exceeded");
+        publish_rejection(hdr, REJECT_PAYLOAD_CAP_EXCEEDED);
         return;
     }
 
@@ -748,21 +774,17 @@ static void process_tuple(const actor_header_t* hdr,
     /* exponential backoff retry loop */
     int attempt = 0;
     while (attempt <= cfg.retry_max) {
-        ssize_t result_len = invoke_handler(hdr, payload, payload_len,
-                                            hdr->attempt + attempt);
-
-        if (result_len > 0) {
-            publish_result(hdr, (size_t)result_len);
+        size_t       result_len = 0;
+        run_status_t run = invoke_handler(hdr, payload, payload_len,
+                                          hdr->attempt + attempt, &result_len);
+        if (run == RUN_OK) {
+            /* no output means nothing to publish */
+            if (result_len > 0) publish_result(hdr, result_len);
             break;
         }
-        if (result_len == 0) {
-            /* handler produced no output — nothing to publish, treat as done */
-            break;
-        }
-
-        if (result_len == -2) {
-            /* result payload cap exceeded — no point retrying */
-            publish_rejection(hdr, "result_cap_exceeded");
+        if (run == RUN_TOO_LARGE) {
+            /* no point retrying */
+            publish_rejection(hdr, REJECT_RESULT_CAP_EXCEEDED);
             break;
         }
 
@@ -771,7 +793,7 @@ static void process_tuple(const actor_header_t* hdr,
 
         attempt++;
         if (attempt > cfg.retry_max) {
-            publish_rejection(hdr, "max_retries_exceeded");
+            publish_rejection(hdr, REJECT_MAX_RETRIES_EXCEEDED);
             break;
         }
 
@@ -838,11 +860,11 @@ static bool replay_next(size_t* frame_len) {
     return fits;
 }
 
-/* One turn of the receive loop, shared by every worker. Returns 0 to keep
-   going, -1 to stop. Split out of actor_run so extra workers can run the
+/* One turn of the receive loop, shared by every worker; false means stop.
+   Split out of actor_run so extra workers can run the
    identical cycle -- the only thing that must NOT be duplicated per worker is
    the heartbeat, which stays in actor_run. */
-static int serve_once(void) {
+static bool serve_once(void) {
     nng_msg*       msg = NULL;
     const uint8_t* frame;
     size_t         frame_len;
@@ -853,11 +875,10 @@ static int serve_once(void) {
         frame  = g_frame_buf;
     } else {
         int rc = nng_recvmsg(nng_sub, &msg, 0);
-        if (rc == NNG_ETIMEDOUT) return 0;
+        if (rc == NNG_ETIMEDOUT) return true;
         if (rc != 0) {
-            if (g_stop) return -1;
-            fprintf(stderr, "[actor] recv error: %s\n", nng_strerror(rc));
-            return -1;
+            if (!g_stop) fprintf(stderr, "[actor] recv error: %s\n", nng_strerror(rc));
+            return false;
         }
         source    = TUPLE_RECEIVED;
         frame     = nng_msg_body(msg);
@@ -867,7 +888,7 @@ static int serve_once(void) {
     if (frame_len < sizeof(actor_header_t)) {
         fprintf(stderr, "[actor] short message %zu bytes, dropping\n", frame_len);
         nng_msg_free(msg);
-        return 0;
+        return true;
     }
 
     const actor_header_t* hdr         = (const actor_header_t*)frame;
@@ -879,13 +900,13 @@ static int serve_once(void) {
        feeding on itself: work whose caller has already given up is dropped
        rather than forked. */
     if (actor_tuple_expired(hdr)) {
-        publish_rejection(hdr, "ttl_expired");
+        publish_rejection(hdr, REJECT_TTL_EXPIRED);
         if (source == TUPLE_REPLAYED) lmdb_del(dbi_inbox, hdr->id, 16);
     } else {
         process_tuple(hdr, payload, payload_len, source);
     }
     if (msg) nng_msg_free(msg);
-    return 0;
+    return true;
 }
 
 #ifndef _WIN32
@@ -895,7 +916,7 @@ static int serve_once(void) {
 static void* worker_main(void* arg) {
     (void)arg;
     while (!g_stop) {
-        if (serve_once() < 0) break;
+        if (!serve_once()) break;
     }
     return NULL;
 }
@@ -964,7 +985,7 @@ int actor_run(void) {
         }
 
         /* receive with 100ms timeout — unblocks for heartbeat check */
-        if (serve_once() < 0) break;
+        if (!serve_once()) break;
     }
 
     fprintf(stderr, "[actor] shutting down\n");
