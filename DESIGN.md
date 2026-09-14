@@ -398,7 +398,8 @@ Every actor emits a heartbeat tuple periodically, listing what it is running:
 ```json
 {"id": "sqlite-tool-1", "inbox": 1, "outbox": 0,
  "running": [{"tuple": "0190…", "correlation": "0190…", "topic": "sql_query",
-              "pid": 4312, "age_ms": 850, "terminating": false}]}
+              "pid": 4312, "age_ms": 850, "terminating": false}],
+ "services": [{"name": "web", "pid": 4100, "restarts": 0}]}
 ```
 
 Topic: `heartbeat`
@@ -459,6 +460,28 @@ publish to the bus can send one — the same trust as any other publish.
 
 ---
 
+## Services
+
+A handler lives for one tuple. A service lives as long as the actor:
+
+```sh
+ACTOR_INIT='./migrate'                  # once, to completion, before anything is served
+ACTOR_SERVICE_web='./web --port 8080'   # started with the actor, restarted when it exits
+```
+
+`ACTOR_INIT` runs after isolation is applied and before the bus is joined; a
+non-zero exit stops the actor, like any other failed startup step. Each
+`ACTOR_SERVICE_<name>` starts before the first tuple is served, in its own
+process group, and the thread that reaps handlers restarts it when it exits.
+After five restarts within a minute the actor gives up and exits non-zero,
+so whatever supervises the actor backs off instead of watching it spin. At
+shutdown, services get SIGTERM once the handlers have drained, and SIGKILL
+after `ACTOR_TERM_GRACE_MS`. The heartbeat lists them under `services`.
+
+Both inherit the actor's isolation. Neither is available on Windows.
+
+---
+
 ## Configuration
 
 | Variable | Required | Default | Description |
@@ -476,6 +499,8 @@ publish to the bus can send one — the same trust as any other publish.
 | `ACTOR_CONCURRENCY` | ☐ | 1 | Messages in flight at once (max 32) |
 | `ACTOR_TERM_GRACE_MS` | ☐ | 5000 | SIGTERM to SIGKILL grace for `_term` (Unix) |
 | `ACTOR_HANDLER_<topic>`, `ACTOR_RESULT_TOPIC_<topic>`, `ACTOR_CONCURRENCY_<topic>` | ☐ | — | Give a topic its own lane (see [Lanes](#lanes)) |
+| `ACTOR_INIT` | ☐ | — | Command run once before serving (see [Services](#services)) |
+| `ACTOR_SERVICE_<name>` | ☐ | — | Command kept running for the actor's lifetime (Unix) |
 
 Isolation (Linux, all optional — see [Isolation](#isolation)):
 

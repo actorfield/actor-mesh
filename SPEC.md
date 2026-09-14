@@ -172,6 +172,12 @@ Lane ≙ { topics ⊆ subscribers, handler, result_topic, concurrency, sub }
   — a topic with any of ACTOR_{HANDLER,RESULT_TOPIC,CONCURRENCY}_<topic>
     set gets a lane of its own; the others share one, which is every topic
     when none is set. Σ lane.concurrency ≤ ACTOR_MAX_CONCURRENCY (32).
+
+Service ≙ { name, cmd, pid, restarts }        — ACTOR_SERVICE_<name>=<cmd>
+  — started before the first tuple, in its own process group; restarted by
+    the reaper when it exits; a 6th exit within 60s stops the actor, which
+    then exits non-zero. ACTOR_INIT runs once, to completion, before the
+    bus is joined. Unix only.
 ```
 
 ---
@@ -493,7 +499,8 @@ procedure EmitHeartbeat(id : char[32]):
   running   ← [ { tuple, correlation, topic, pid, age_ms, terminating }
                 | slot ∈ children, slot busy ]      — [] on Windows
   payload   ← FormatJson({ id: id, inbox: inbox_sz, outbox: outbox_sz,
-                           running: running })
+                           running: running,
+                           services: [ { name, pid, restarts } ] })
   plen      ← strlen(payload)
 
   Init(&hdr, "heartbeat", id, null, null, plen)

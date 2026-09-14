@@ -656,6 +656,107 @@ static void t_lanes_overcommit_fails(void) {
     CHECK(gone, "an actor whose lanes ask for 40 workers started anyway");
 }
 
+/* ── 12. Init and services ────────────────────────────────────────────────── */
+
+/* The exit code, or -1 if p is still running after budget ms. */
+static int exit_code(pid_t p, int budget) {
+    for (int64_t end = now_ms() + budget; now_ms() < end; ms(50)) {
+        int st;
+        if (waitpid(p, &st, WNOHANG) == p)
+            return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+    }
+    return -1;
+}
+
+/* An actor on `work` with a fresh LMDB at dir, plus the given env entries. */
+static pid_t spawn_with(const char *dir, const char *const *extra) {
+    static char d[256];
+    snprintf(d, sizeof d, "ACTOR_LMDB_PATH=%s", dir);
+    char cmd[512]; snprintf(cmd, sizeof cmd, "rm -rf %s; mkdir -p %s", dir, dir);
+    system(cmd);
+    const char *e[24] = { "ACTOR_BUS_SUB=" SP, "ACTOR_BUS_PUB=" PP, "ACTOR_ID=tc",
+                          "ACTOR_TOPIC=work", "ACTOR_RESULT_TOPIC=done", "ACTOR_RETRY_MAX=0", d };
+    int n = 7;
+    for (; *extra && n < 23; extra++) e[n++] = *extra;
+    e[n] = NULL;
+    char *a[] = { "./bin/actor", NULL };
+    return sp_(a, (char **)e);
+}
+
+static void t_init_runs_before_serving(void) {
+    TEST("ACTOR_INIT runs to completion, and the actor serves after it");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -f /tmp/tc_init_mark");
+    const char *x[] = { "ACTOR_HEARTBEAT_MS=0",
+                        "ACTOR_INIT=sleep 0.3; echo ready > /tmp/tc_init_mark",
+                        "ACTOR_HANDLER=sh -c 'echo :$(cat /tmp/tc_init_mark)'", NULL };
+    pid_t ap = spawn_with("/tmp/tc_init", x);
+    nng_socket done = sub_open("done");
+    ms(900);
+    sendm("work", "x", 0, 0);
+    char got[64] = {0};
+    int n = drain_n(done, 3000, 1, got, sizeof got);
+    nng_close(done);
+    stop(pp, ap);
+    printf("  result=%.20s\n", got);
+    CHECK(n == 1 && strncmp(got, ":ready", 6) == 0, "the handler did not see ACTOR_INIT's work");
+}
+
+static void t_init_failure_stops(void) {
+    TEST("a failing ACTOR_INIT stops the actor");
+    cleanup();
+    pid_t pp = start_proxy();
+    const char *x[] = { "ACTOR_HEARTBEAT_MS=0", "ACTOR_INIT=exit 3",
+                        "ACTOR_HANDLER=sh -c 'echo :ok'", NULL };
+    pid_t ap = spawn_with("/tmp/tc_init2", x);
+    int code = exit_code(ap, 3000);
+    stop(pp, code >= 0 ? -1 : ap);
+    printf("  exit=%d\n", code);
+    CHECK(code > 0, "an actor whose ACTOR_INIT failed kept going");
+}
+
+static void t_service_restarts_then_gives_up(void) {
+    TEST("a service is restarted 5 times, then the actor gives up and exits non-zero");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -f /tmp/tc_svc_log");
+    const char *x[] = { "ACTOR_HEARTBEAT_MS=0", "ACTOR_HANDLER=sh -c 'echo :ok'",
+                        "ACTOR_SERVICE_flaky=echo up >> /tmp/tc_svc_log; sleep 0.2; exit 1", NULL };
+    pid_t ap = spawn_with("/tmp/tc_svc", x);
+    int code = exit_code(ap, 8000);
+    stop(pp, code >= 0 ? -1 : ap);
+    char log[256]; slurp("/tmp/tc_svc_log", log, sizeof log);
+    int starts = 0;
+    for (const char *p = log; (p = strstr(p, "up")); p += 2) starts++;
+    printf("  starts=%d exit=%d\n", starts, code);
+    CHECK(starts == 6, "not started once and restarted exactly 5 times");
+    CHECK(code > 0, "the actor did not exit non-zero once the restart budget ran out");
+}
+
+static void t_service_lives_with_the_actor(void) {
+    TEST("a service shows in the heartbeat and stops with the actor");
+    cleanup();
+    pid_t pp = start_proxy();
+    const char *x[] = { "ACTOR_HEARTBEAT_MS=200", "ACTOR_HANDLER=sh -c 'echo :ok'",
+                        "ACTOR_SERVICE_sleeper=sleep 35", NULL };
+    pid_t ap = spawn_with("/tmp/tc_svc2", x);
+    nng_socket hb = sub_open("heartbeat");
+    char beat[8192];
+    last_payload(hb, 800, "\"id\":\"tc\"", beat, sizeof beat);
+    nng_close(hb);
+    int running = procs_named("sleep 35");
+    kill(ap, SIGTERM);
+    int code = exit_code(ap, 5000);
+    int left = procs_named("sleep 35");
+    stop(pp, code >= 0 ? -1 : ap);
+    system("pkill -9 -x sleep 2>/dev/null");
+    printf("  running=%d left=%d exit=%d  %.150s\n", running, left, code, strstr(beat, "\"services\"") ? strstr(beat, "\"services\"") : beat);
+    CHECK(strstr(beat, "\"services\":[{\"name\":\"sleeper\"") != NULL,
+          "the heartbeat did not list the service");
+    CHECK(running == 1 && left == 0 && code == 0, "the service did not stop with the actor");
+}
+
 int main(void) {
     printf("actor concurrency tests\n\n");
     t_parallel();
@@ -678,6 +779,10 @@ int main(void) {
     t_deadline_reaches_handler();
     t_lane_does_not_wait();
     t_lanes_overcommit_fails();
+    t_init_runs_before_serving();
+    t_init_failure_stops();
+    t_service_restarts_then_gives_up();
+    t_service_lives_with_the_actor();
     cleanup();
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED",
            failures, failures == 1 ? "" : "s");

@@ -443,6 +443,16 @@ typedef enum {
 #ifdef _WIN32
 
 static void running_json(char* out, size_t cap) { snprintf(out, cap, "[]"); }
+static void services_json(char* out, size_t cap) { snprintf(out, cap, "[]"); }
+
+static bool services_requested(void) {
+    char* env   = GetEnvironmentStringsA();
+    bool  found = false;
+    for (char* p = env; p && *p; p += strlen(p) + 1)
+        if (strncmp(p, "ACTOR_SERVICE_", 14) == 0) { found = true; break; }
+    if (env) FreeEnvironmentStringsA(env);
+    return found;
+}
 
 static run_status_t platform_spawn(const uint8_t* in,  size_t in_len,
                                    uint8_t*       out, size_t out_cap,
@@ -645,6 +655,147 @@ static void running_json(char* out, size_t cap) {
     out[n]   = '\0';
 }
 
+/* ── Services ──────────────────────────────────────────────────────────────
+ *
+ * A handler lives for one tuple; a service lives as long as the actor.
+ * ACTOR_SERVICE_<name>=<command> is started before any tuple is served and
+ * restarted by the reaper when it exits. More than SERVICE_RESTARTS restarts
+ * inside SERVICE_WINDOW_MS and the actor gives up and exits non-zero, so
+ * whatever supervises it backs off rather than watching it spin. */
+#define ACTOR_MAX_SERVICES 8
+#define SERVICE_RESTARTS   5
+#define SERVICE_WINDOW_MS  60000
+
+typedef struct {
+    char        name[32];
+    const char* cmd;
+    pid_t       pid;                        /* 0 = not running; also its group */
+    int         restarts;
+    int64_t     recent[SERVICE_RESTARTS];   /* when the last restarts happened */
+} service_t;
+
+static service_t  g_services[ACTOR_MAX_SERVICES];
+static int        g_nservices;
+static atomic_int g_services_failed;
+
+extern char** environ;
+
+static int services_load(void) {
+    static const char prefix[] = "ACTOR_SERVICE_";
+    const size_t      plen     = sizeof(prefix) - 1;
+    for (char** e = environ; *e; e++) {
+        const char* eq = strchr(*e, '=');
+        if (strncmp(*e, prefix, plen) != 0 || !eq || !eq[1]) continue;
+        if (g_nservices == ACTOR_MAX_SERVICES) {
+            fprintf(stderr, "[actor] more than %d ACTOR_SERVICE_* entries\n", ACTOR_MAX_SERVICES);
+            return -1;
+        }
+        service_t* s = &g_services[g_nservices++];
+        snprintf(s->name, sizeof(s->name), "%.*s", (int)(eq - *e - plen), *e + plen);
+        s->cmd = eq + 1;
+    }
+    return 0;
+}
+
+static void service_spawn(service_t* s) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        setpgid(0, 0);
+        execl("/bin/sh", "sh", "-c", s->cmd, NULL);
+        _exit(127);
+    }
+    if (pid < 0) fprintf(stderr, "[actor] service %s: fork: %s\n", s->name, strerror(errno));
+    else         setpgid(pid, pid);
+    s->pid = pid > 0 ? pid : 0;
+}
+
+/* Reaper only: restart a service that exited, within its budget. */
+static void service_reaped(pid_t pid, int status) {
+    for (int i = 0; i < g_nservices; i++) {
+        service_t* s = &g_services[i];
+        if (s->pid != pid) continue;
+        s->pid = 0;
+        if (g_stop) return;
+        int64_t now    = mono_ms();
+        int     recent = 0;
+        for (int k = 0; k < SERVICE_RESTARTS; k++)
+            if (s->recent[k] && now - s->recent[k] < SERVICE_WINDOW_MS) recent++;
+        if (recent == SERVICE_RESTARTS) {
+            fprintf(stderr, "[actor] service %s restarted %d times in %ds; giving up\n",
+                    s->name, SERVICE_RESTARTS, SERVICE_WINDOW_MS / 1000);
+            atomic_store(&g_services_failed, 1);
+            g_stop = 1;
+            return;
+        }
+        s->recent[s->restarts++ % SERVICE_RESTARTS] = now;
+        fprintf(stderr, "[actor] service %s (pid %d) exited with status %d; restarting\n",
+                s->name, (int)pid,
+                WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status));
+        service_spawn(s);
+        return;
+    }
+}
+
+/* Reaper only, at shutdown: SIGTERM each service, SIGKILL after the grace. */
+static void services_stop(void) {
+    int64_t kill_at = mono_ms() + cfg.term_grace_ms;
+    bool    killed  = false;
+    for (int i = 0; i < g_nservices; i++)
+        if (g_services[i].pid) kill(-g_services[i].pid, SIGTERM);
+    for (;;) {
+        bool left = false;
+        for (int i = 0; i < g_nservices; i++) left |= g_services[i].pid != 0;
+        if (!left) return;
+        if (!killed && mono_ms() >= kill_at) {
+            for (int i = 0; i < g_nservices; i++)
+                if (g_services[i].pid) kill(-g_services[i].pid, SIGKILL);
+            killed = true;
+        }
+        int   st;
+        pid_t pid = waitpid(-1, &st, WNOHANG);
+        if (pid < 0 && errno == ECHILD) return;
+        if (pid > 0) {
+            for (int i = 0; i < g_nservices; i++)
+                if (g_services[i].pid == pid) g_services[i].pid = 0;
+            continue;
+        }
+        struct timespec ts = { 0, 5 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+}
+
+static void services_json(char* out, size_t cap) {
+    size_t n = 0;
+    out[n++] = '[';
+    for (int i = 0; i < g_nservices; i++) {
+        const service_t* s = &g_services[i];
+        int w = snprintf(out + n, cap - n, "%s{\"name\":\"%s\",\"pid\":%d,\"restarts\":%d}",
+                         n > 1 ? "," : "", s->name, (int)s->pid, s->restarts);
+        if (w < 0 || (size_t)w >= cap - n - 1) break;
+        n += (size_t)w;
+    }
+    out[n++] = ']';
+    out[n]   = '\0';
+}
+
+/* ACTOR_INIT runs once, to completion, before anything is served. A failure
+   stops the actor like any other startup step. */
+static int run_init(void) {
+    const char* cmd = getenv("ACTOR_INIT");
+    if (!cmd || !*cmd) return 0;
+    pid_t pid = fork();
+    if (pid == 0) {
+        execl("/bin/sh", "sh", "-c", cmd, NULL);
+        _exit(127);
+    }
+    int st = 0;
+    if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        fprintf(stderr, "[actor] ACTOR_INIT failed\n");
+        return -1;
+    }
+    return 0;
+}
+
 /* Reaper thread: the only caller of waitpid in the process. */
 static void* reaper_main(void* arg) {
     (void)arg;
@@ -674,7 +825,9 @@ static void* reaper_main(void* arg) {
            was the whole job -- nothing to dispatch. */
         pthread_cond_broadcast(&child_cv);
         pthread_mutex_unlock(&child_mu);
+        service_reaped(pid, status);
     }
+    services_stop();
     return NULL;
 }
 
@@ -965,15 +1118,16 @@ static void publish_rejection(const actor_header_t* in_hdr, reject_reason_t why)
 
 static void emit_heartbeat(void) {
     char running[ACTOR_MAX_CONCURRENCY * 224];
+    char services[1024];
     running_json(running, sizeof(running));
+    services_json(services, sizeof(services));
 
-    char   payload[sizeof(running) + 256];
+    char   payload[sizeof(running) + sizeof(services) + 256];
     size_t plen = (size_t)snprintf(payload, sizeof(payload),
-                                   "{\"id\":\"%s\",\"inbox\":%zu,\"outbox\":%zu,\"running\":%s}",
-                                   cfg.id,
-                                   lmdb_count(dbi_inbox),
-                                   lmdb_count(dbi_outbox),
-                                   running);
+                                   "{\"id\":\"%s\",\"inbox\":%zu,\"outbox\":%zu,"
+                                   "\"running\":%s,\"services\":%s}",
+                                   cfg.id, lmdb_count(dbi_inbox), lmdb_count(dbi_outbox),
+                                   running, services);
     if (plen >= sizeof(payload)) plen = sizeof(payload) - 1;
 
     actor_header_t hdr;
@@ -1186,6 +1340,14 @@ static void* worker_main(void* arg) {
 
 int actor_run(void) {
     if (cfg_load() < 0 || lanes_load() < 0) return -1;
+#ifdef _WIN32
+    if (getenv("ACTOR_INIT") || services_requested()) {
+        fprintf(stderr, "[actor] ACTOR_INIT and ACTOR_SERVICE_* are not available on Windows\n");
+        return -1;
+    }
+#else
+    if (services_load() < 0) return -1;
+#endif
 
 #ifndef _WIN32
     /* Confinement goes here and nowhere else: after the config read, before
@@ -1196,6 +1358,7 @@ int actor_run(void) {
         fprintf(stderr, "[actor] FATAL: isolation requested but not applied\n");
         return -1;
     }
+    if (run_init() < 0) return -1;
 #endif
 
     signal(SIGTERM, on_signal);
@@ -1216,6 +1379,8 @@ int actor_run(void) {
     /* The reaper runs even at concurrency 1: it is what collects the orphaned
        grandchildren this process inherits as PID 1, a job the old between-
        messages sweep used to do. */
+    for (int i = 0; i < g_nservices; i++) service_spawn(&g_services[i]);
+
     pthread_t reaper;
     int reaper_started = (pthread_create(&reaper, NULL, reaper_main, NULL) == 0);
     if (!reaper_started) {
@@ -1257,5 +1422,8 @@ int actor_run(void) {
     nng_close(nng_ctl);
 #endif
     mdb_env_close(mdb_env);
+#ifndef _WIN32
+    if (atomic_load(&g_services_failed)) return -1;
+#endif
     return 0;
 }
