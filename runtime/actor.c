@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <errno.h>
 #include <time.h>
 #include <sys/wait.h>
@@ -164,6 +165,10 @@ static volatile sig_atomic_t g_stop = 0;
 static uint8_t    g_replay[ACTOR_MAX_CONCURRENCY][16];
 static int        g_replay_n;
 static atomic_int g_replay_next;
+
+/* Where a worker's frame came from. A replayed one lives in g_frame_buf and
+   is already in the inbox. */
+typedef enum { TUPLE_RECEIVED, TUPLE_REPLAYED } tuple_source_t;
 
 /* ── Signal ──────────────────────────────────────────────────────────────── */
 
@@ -679,16 +684,17 @@ static void publish_rejection(const actor_header_t* in_hdr, const char* reason) 
         "\"origin\":\"%s\",\"topic\":\"%.*s\",\"reason\":\"%s\"}",
         id_hex, corr_hex,
         origin, 32, in_hdr->topic, reason);
+    if (plen >= sizeof(payload)) plen = sizeof(payload) - 1;
 
     actor_header_t hdr;
     actor_tuple_init(&hdr, "tuple_rejected", cfg.id,
                      in_hdr->correlation_id, in_hdr->id, (uint32_t)plen);
     actor_uuid_gen(hdr.id);
 
-    size_t frame_len = sizeof(actor_header_t) + plen;
-    memcpy(g_frame_buf, &hdr, sizeof(actor_header_t));
-    memcpy(g_frame_buf + sizeof(actor_header_t), payload, plen);
-    nng_send(nng_pub, g_frame_buf, frame_len, 0);
+    uint8_t frame[sizeof(actor_header_t) + sizeof(payload)];
+    memcpy(frame, &hdr, sizeof(actor_header_t));
+    memcpy(frame + sizeof(actor_header_t), payload, plen);
+    nng_send(nng_pub, frame, sizeof(actor_header_t) + plen, 0);
 
     fprintf(stderr, "[actor] rejected tuple %s reason=%s\n", id_hex, reason);
 }
@@ -702,35 +708,42 @@ static void emit_heartbeat(void) {
                                    cfg.id,
                                    lmdb_count(dbi_inbox),
                                    lmdb_count(dbi_outbox));
+    if (plen >= sizeof(payload)) plen = sizeof(payload) - 1;
 
     actor_header_t hdr;
     actor_tuple_init(&hdr, "heartbeat", cfg.id, NULL, NULL, (uint32_t)plen);
     actor_uuid_gen(hdr.id);
     hdr.ttl = (int64_t)cfg.heartbeat_ms * 3 * 1000000LL;
 
-    /* assemble header + payload into frame buffer and send */
-    size_t frame_len = sizeof(actor_header_t) + plen;
-    memcpy(g_frame_buf, &hdr, sizeof(actor_header_t));
-    memcpy(g_frame_buf + sizeof(actor_header_t), payload, plen);
-    nng_send(nng_pub, g_frame_buf, frame_len, 0);
+    uint8_t frame[sizeof(actor_header_t) + sizeof(payload)];
+    memcpy(frame, &hdr, sizeof(actor_header_t));
+    memcpy(frame + sizeof(actor_header_t), payload, plen);
+    nng_send(nng_pub, frame, sizeof(actor_header_t) + plen, 0);
 }
 
 /* ── Process one tuple ───────────────────────────────────────────────────── */
 
 static void process_tuple(const actor_header_t* hdr,
                           const uint8_t*        payload,
-                          size_t                payload_len) {
+                          size_t                payload_len,
+                          tuple_source_t        source) {
     /* hard cap on incoming payload */
     if (payload_len > ACTOR_MAX_PAYLOAD) {
         publish_rejection(hdr, "payload_cap_exceeded");
         return;
     }
 
-    /* write inbox LMDB — assemble frame into static buffer */
+    /* publish_result reuses g_frame_buf, which may hold this very frame */
+    uint8_t id[16];
+    memcpy(id, hdr->id, sizeof(id));
+
+    /* write inbox LMDB — a replay is already in g_frame_buf */
     size_t frame_len = sizeof(actor_header_t) + payload_len;
-    memcpy(g_frame_buf, hdr, sizeof(actor_header_t));
-    memcpy(g_frame_buf + sizeof(actor_header_t), payload, payload_len);
-    lmdb_put(dbi_inbox, hdr->id, 16, g_frame_buf, frame_len);
+    if (source == TUPLE_RECEIVED) {
+        memcpy(g_frame_buf, hdr, sizeof(actor_header_t));
+        memcpy(g_frame_buf + sizeof(actor_header_t), payload, payload_len);
+    }
+    lmdb_put(dbi_inbox, id, sizeof(id), g_frame_buf, frame_len);
 
     /* exponential backoff retry loop */
     int attempt = 0;
@@ -768,7 +781,7 @@ static void process_tuple(const actor_header_t* hdr,
         fprintf(stderr, "[actor] retry %d/%d\n", attempt, cfg.retry_max);
     }
 
-    lmdb_del(dbi_inbox, hdr->id, 16);
+    lmdb_del(dbi_inbox, id, sizeof(id));
 }
 
 /* ── Main loop ───────────────────────────────────────────────────────────── */
@@ -800,24 +813,29 @@ static void process_tuple(const actor_header_t* hdr,
  *
  */
 
-/* Load the next unclaimed replay into *msg, as attempt + 1. */
-static int replay_next(nng_msg** msg) {
-    if (atomic_load(&g_replay_next) >= g_replay_n) return 0;
+/* Copy the next unclaimed replay into g_frame_buf, as attempt + 1. */
+static bool replay_next(size_t* frame_len) {
+    if (atomic_load(&g_replay_next) >= g_replay_n) return false;
     int i = atomic_fetch_add(&g_replay_next, 1);
-    if (i >= g_replay_n) return 0;
+    if (i >= g_replay_n) return false;
 
     MDB_txn* txn;
     MDB_val  k = { 16, g_replay[i] }, v;
-    int      ok = 0;
-    if (mdb_txn_begin(mdb_env, NULL, MDB_RDONLY, &txn) != 0) return 0;
-    if (mdb_get(txn, dbi_inbox, &k, &v) == 0 && v.mv_size >= sizeof(actor_header_t) &&
-        nng_msg_alloc(msg, 0) == 0) {
-        nng_msg_append(*msg, v.mv_data, v.mv_size);
-        ((actor_header_t*)nng_msg_body(*msg))->attempt++;
-        ok = 1;
+    if (mdb_txn_begin(mdb_env, NULL, MDB_RDONLY, &txn) != 0) return false;
+    bool found = mdb_get(txn, dbi_inbox, &k, &v) == 0;
+    bool fits  = found && v.mv_size >= sizeof(actor_header_t) && v.mv_size <= ACTOR_MAX_FRAME;
+    if (fits) {
+        memcpy(g_frame_buf, v.mv_data, v.mv_size);
+        ((actor_header_t*)g_frame_buf)->attempt++;
+        *frame_len = v.mv_size;
     }
     mdb_txn_abort(txn);
-    return ok;
+    if (found && !fits) {
+        fprintf(stderr, "[actor] inbox entry of %zu bytes cannot be replayed, dropping\n",
+                v.mv_size);
+        lmdb_del(dbi_inbox, g_replay[i], 16);
+    }
+    return fits;
 }
 
 /* One turn of the receive loop, shared by every worker. Returns 0 to keep
@@ -825,9 +843,15 @@ static int replay_next(nng_msg** msg) {
    identical cycle -- the only thing that must NOT be duplicated per worker is
    the heartbeat, which stays in actor_run. */
 static int serve_once(void) {
-    nng_msg* msg = NULL;
-    int replayed = replay_next(&msg);
-    if (!replayed) {
+    nng_msg*       msg = NULL;
+    const uint8_t* frame;
+    size_t         frame_len;
+    tuple_source_t source;
+
+    if (replay_next(&frame_len)) {
+        source = TUPLE_REPLAYED;
+        frame  = g_frame_buf;
+    } else {
         int rc = nng_recvmsg(nng_sub, &msg, 0);
         if (rc == NNG_ETIMEDOUT) return 0;
         if (rc != 0) {
@@ -835,20 +859,20 @@ static int serve_once(void) {
             fprintf(stderr, "[actor] recv error: %s\n", nng_strerror(rc));
             return -1;
         }
+        source    = TUPLE_RECEIVED;
+        frame     = nng_msg_body(msg);
+        frame_len = nng_msg_len(msg);
     }
 
-    void*  body     = nng_msg_body(msg);
-    size_t body_len = nng_msg_len(msg);
-
-    if (body_len < sizeof(actor_header_t)) {
-        fprintf(stderr, "[actor] short message %zu bytes, dropping\n", body_len);
+    if (frame_len < sizeof(actor_header_t)) {
+        fprintf(stderr, "[actor] short message %zu bytes, dropping\n", frame_len);
         nng_msg_free(msg);
         return 0;
     }
 
-    const actor_header_t* hdr         = (const actor_header_t*)body;
-    const uint8_t*        payload     = (const uint8_t*)body + sizeof(actor_header_t);
-    size_t                payload_len = body_len - sizeof(actor_header_t);
+    const actor_header_t* hdr         = (const actor_header_t*)frame;
+    const uint8_t*        payload     = frame + sizeof(actor_header_t);
+    size_t                payload_len = frame_len - sizeof(actor_header_t);
 
     /* TTL check — before process_tuple, so an abandoned request costs the
        check and nothing else. This is what keeps a backed-up queue from
@@ -856,13 +880,11 @@ static int serve_once(void) {
        rather than forked. */
     if (actor_tuple_expired(hdr)) {
         publish_rejection(hdr, "ttl_expired");
-        if (replayed) lmdb_del(dbi_inbox, hdr->id, 16);
-        nng_msg_free(msg);
-        return 0;
+        if (source == TUPLE_REPLAYED) lmdb_del(dbi_inbox, hdr->id, 16);
+    } else {
+        process_tuple(hdr, payload, payload_len, source);
     }
-
-    process_tuple(hdr, payload, payload_len);
-    nng_msg_free(msg);
+    if (msg) nng_msg_free(msg);
     return 0;
 }
 
