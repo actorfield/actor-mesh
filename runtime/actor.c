@@ -666,12 +666,19 @@ static void publish_rejection(const actor_header_t* in_hdr, const char* reason) 
     actor_uuid_hex(in_hdr->id,             id_hex);
     actor_uuid_hex(in_hdr->correlation_id, corr_hex);
 
+    /* Header strings are null-padded, not terminated, and origin is the
+       sender's to choose: bound both, and keep origin from breaking the JSON. */
+    char origin[33];
+    snprintf(origin, sizeof(origin), "%.*s", 32, in_hdr->origin);
+    for (char* c = origin; *c; c++)
+        if (*c == '"' || *c == '\\' || (unsigned char)*c < 0x20) *c = '?';
+
     char payload[512];
     size_t plen = (size_t)snprintf(payload, sizeof(payload),
         "{\"tuple_id\":\"%s\",\"correlation_id\":\"%s\","
-        "\"origin\":\"%s\",\"topic\":\"%s\",\"reason\":\"%s\"}",
+        "\"origin\":\"%s\",\"topic\":\"%.*s\",\"reason\":\"%s\"}",
         id_hex, corr_hex,
-        in_hdr->origin, in_hdr->topic, reason);
+        origin, 32, in_hdr->topic, reason);
 
     actor_header_t hdr;
     actor_tuple_init(&hdr, "tuple_rejected", cfg.id,

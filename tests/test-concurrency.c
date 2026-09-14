@@ -53,13 +53,14 @@ static int64_t now_ms(void) {
 }
 
 /* Build and publish a frame. ttl_ns 0 = no expiry. */
-static void sendm(const char *topic, const char *payload, int64_t ttl_ns, int64_t emitted_override) {
+static void sendm_as(const char *origin, const char *topic, const char *payload,
+                     int64_t ttl_ns, int64_t emitted_override) {
     nng_socket s; nng_pub0_open(&s); nng_dial(s, PP, NULL, 0); ms(60);
     size_t pl = strlen(payload);
     uint8_t f[1024] = {0};
     size_t tl = strlen(topic); if (tl > 31) tl = 31;
     memcpy(f, topic, tl);
-    memcpy(f + 80, "test", 4);                       /* origin */
+    memcpy(f + 80, origin, strnlen(origin, 32));     /* origin */
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
     int64_t ns = emitted_override ? emitted_override
                                   : ts.tv_sec * 1000000000LL + ts.tv_nsec;
@@ -70,6 +71,10 @@ static void sendm(const char *topic, const char *payload, int64_t ttl_ns, int64_
     memcpy(f + 256, payload, pl);
     nng_send(s, f, 256 + pl, 0);
     nng_close(s);
+}
+
+static void sendm(const char *topic, const char *payload, int64_t ttl_ns, int64_t emitted_override) {
+    sendm_as("test", topic, payload, ttl_ns, emitted_override);
 }
 
 /* Subscribers must exist BEFORE anything is published — this is pub/sub, so a
@@ -402,6 +407,27 @@ static void t_stop_leaves_unfinished(void) {
     CHECK(n == 1 && strcmp(log, "0 1 ") == 0, "the unfinished tuple was not replayed");
 }
 
+/* ── 7. Rejections ────────────────────────────────────────────────────────── */
+
+static void t_rejection_bounds_origin(void) {
+    TEST("a rejection quotes a full-width origin within its field, as valid JSON");
+    cleanup();
+    pid_t pp = start_proxy();
+    pid_t ap = start_actor("sh -c 'echo :ok'", "1", "0", "/tmp/tc_rj");
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    int64_t old = (ts.tv_sec - 10) * 1000000000LL + ts.tv_nsec;
+    nng_socket rej = sub_open("tuple_rejected");
+    /* 32 bytes, no terminator, one quote; expired so it is rejected on arrival */
+    sendm_as("ab\"cdefghijklmnopqrstuvwxyz01234", "work", "x", 1000000000LL, old);
+    char body[512] = {0};
+    drain_n(rej, 3000, 1, body, sizeof body);
+    nng_close(rej);
+    stop(pp, ap);
+    printf("  %.200s\n", body);
+    CHECK(strstr(body, "\"origin\":\"ab?cdefghijklmnopqrstuvwxyz01234\",\"topic\":\"work\"") != NULL,
+          "origin ran past its field or broke the JSON");
+}
+
 int main(void) {
     printf("actor concurrency tests\n\n");
     t_parallel();
@@ -415,6 +441,7 @@ int main(void) {
     t_retry_attempts_and_backoff();
     t_replay_after_crash();
     t_stop_leaves_unfinished();
+    t_rejection_bounds_origin();
     cleanup();
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED",
            failures, failures == 1 ? "" : "s");
