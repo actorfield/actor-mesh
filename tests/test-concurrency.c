@@ -309,6 +309,34 @@ static void t_live_ttl_still_runs(void) {
     CHECK(n == 1, "a live tuple was dropped");
 }
 
+/* ── 5. Retries ───────────────────────────────────────────────────────────── */
+
+static void t_retry_attempts_and_backoff(void) {
+    TEST("retries count up in ACTOR_ATTEMPT and keep backing off past 1s");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -f /tmp/tc_retry_log");
+    pid_t ap = start_actor("sh -c 'echo $ACTOR_ATTEMPT >> /tmp/tc_retry_log; exit 1'",
+                           "1", "5", "/tmp/tc_retry");
+    nng_socket rej = sub_open("tuple_rejected");
+    int64_t t0 = now_ms();
+    sendm("work", "x", 0, 0);
+    int rejected = drain_n(rej, 8000, 1, NULL, 0);
+    int64_t elapsed = now_ms() - t0;
+    nng_close(rej);
+    stop(pp, ap);
+    char log[64] = {0};
+    FILE *f = fopen("/tmp/tc_retry_log", "r");
+    if (f) { log[fread(log, 1, sizeof log - 1, f)] = 0; fclose(f); }
+    int ok = strcmp(log, "0\n1\n2\n3\n4\n5\n") == 0;
+    for (char *c = log; *c; c++) if (*c == '\n') *c = ' ';
+    printf("  rejected=%d elapsed=%lldms attempts=[%s]\n", rejected, (long long)elapsed, log);
+    CHECK(rejected == 1, "exhausted retries were not rejected");
+    CHECK(ok, "ACTOR_ATTEMPT did not count the retries");
+    /* 100+200+400+800+1600ms: the fifth backoff is the one that used to vanish */
+    CHECK(elapsed >= 3100, "backoff was skipped");
+}
+
 int main(void) {
     printf("actor concurrency tests\n\n");
     t_parallel();
@@ -319,6 +347,7 @@ int main(void) {
     t_orphans_reaped();
     t_ttl_expired_not_run();
     t_live_ttl_still_runs();
+    t_retry_attempts_and_backoff();
     cleanup();
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED",
            failures, failures == 1 ? "" : "s");

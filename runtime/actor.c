@@ -575,13 +575,14 @@ static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
  * the parent before CreateProcess on Windows). */
 static ssize_t invoke_handler(const actor_header_t* hdr,
                               const uint8_t*        payload,
-                              size_t                payload_len) {
+                              size_t                payload_len,
+                              int                   attempt) {
     child_env_t env;
     actor_uuid_hex(hdr->id,             env.id_hex);
     actor_uuid_hex(hdr->correlation_id, env.corr_hex);
     actor_uuid_hex(hdr->causation_id,   env.caus_hex);
     snprintf(env.origin,  sizeof(env.origin),  "%.*s", 31, hdr->origin);
-    snprintf(env.attempt, sizeof(env.attempt), "%d", hdr->attempt);
+    snprintf(env.attempt, sizeof(env.attempt), "%d", attempt);
     snprintf(env.topic,   sizeof(env.topic),   "%.*s", 32, hdr->topic);
 
     return platform_spawn(payload, payload_len, g_result_buf, ACTOR_MAX_PAYLOAD, &env);
@@ -721,7 +722,8 @@ static void process_tuple(const actor_header_t* hdr,
     /* exponential backoff retry loop */
     int attempt = 0;
     while (attempt <= cfg.retry_max) {
-        ssize_t result_len = invoke_handler(hdr, payload, payload_len);
+        ssize_t result_len = invoke_handler(hdr, payload, payload_len,
+                                            hdr->attempt + attempt);
 
         if (result_len > 0) {
             publish_result(hdr, (size_t)result_len);
@@ -744,10 +746,8 @@ static void process_tuple(const actor_header_t* hdr,
             break;
         }
 
-        struct timespec backoff = {
-            .tv_sec  = 0,
-            .tv_nsec = (long)(100000000LL << (attempt - 1))
-        };
+        int64_t ns = 100000000LL << (attempt < 20 ? attempt - 1 : 19);
+        struct timespec backoff = { ns / 1000000000LL, ns % 1000000000LL };
         nanosleep(&backoff, NULL);
         fprintf(stderr, "[actor] retry %d/%d\n", attempt, cfg.retry_max);
     }
