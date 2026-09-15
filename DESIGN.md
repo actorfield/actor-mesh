@@ -186,7 +186,7 @@ int main(void) {
    b. Otherwise NNG recvmsg (100ms timeout)
    c. Receive header + payload as single buffer
    d. Cast to actor_header_t (zero copy)
-   e. Check TTL — drop if expired
+   e. Stamp emitted_at if it arrived as 0; check TTL — drop if expired
    f. Write frame to LMDB inbox (durability)
    g. Set header env vars, fork handler (+ per-tuple namespaces if configured)
    h. Write payload to handler stdin
@@ -436,6 +436,11 @@ before the handler runs and again before each retry, so a tuple whose caller
 has given up is rejected as `ttl_expired` rather than run again. A running
 handler is not stopped at it; it can read the deadline from
 `ACTOR_TUPLE_DEADLINE` and budget its own work.
+
+A producer whose clock may be skewed from the actors' sends only a `ttl` and
+leaves `emitted_at` at 0. The first actor to receive the tuple stamps it from
+its own clock before checking TTL, and the stamp goes into the inbox with the
+tuple, so a replay keeps it. A non-zero `emitted_at` is never changed.
 
 ---
 

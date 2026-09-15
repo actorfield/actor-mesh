@@ -213,7 +213,11 @@ static int lanes_load(void) {
             if (!own) shared = l;
         }
         size_t used = strlen(l->topics);
-        snprintf(l->topics + used, sizeof(l->topics) - used, "%s%s", used ? "," : "", t);
+        int    n    = snprintf(l->topics + used, sizeof(l->topics) - used, "%s%s", used ? "," : "", t);
+        if (n < 0 || (size_t)n >= sizeof(l->topics) - used) {
+            fprintf(stderr, "[actor] a lane's topics do not fit in %d bytes\n", (int)sizeof(l->topics) - 1);
+            return -1;
+        }
     }
     if (g_nlanes == 0) {
         fprintf(stderr, "[actor] ACTOR_TOPIC names no topic\n");
@@ -318,9 +322,9 @@ static int nng_setup(void) {
             return -1;
         }
         if (dial_retry(l->sub, cfg.bus_sub, "sub") < 0) return -1;
-        char  list[256];
+        char  list[sizeof(l->topics)];
         char* save = NULL;
-        snprintf(list, sizeof(list), "%s", l->topics);
+        memcpy(list, l->topics, sizeof(list));
         for (char* t = strtok_r(list, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
             if ((rc = nng_socket_set(l->sub, NNG_OPT_SUB_SUBSCRIBE, t, strlen(t) + 1)) != 0) {
                 fprintf(stderr, "[actor] sub subscribe %s: %s\n", t, nng_strerror(rc));
@@ -1353,6 +1357,20 @@ static bool serve_once(int lane) {
         return true;
     }
 
+    /* A producer whose clock the runtime can't trust leaves emitted_at at 0,
+       and the first actor to receive the tuple stamps it from its own clock.
+       TTL is judged as now > emitted_at + ttl, so a stamp from a skewed clock
+       would expire tuples early or never. Stamped before the inbox write, so
+       a replay keeps it. */
+    if (source == TUPLE_RECEIVED) {
+        actor_header_t* in = (actor_header_t*)nng_msg_body(msg);
+        if (in->emitted_at == 0) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            in->emitted_at = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+        }
+    }
+
     const actor_header_t* hdr         = (const actor_header_t*)frame;
     const uint8_t*        payload     = frame + sizeof(actor_header_t);
     size_t                payload_len = frame_len - sizeof(actor_header_t);
@@ -1384,7 +1402,23 @@ static void* worker_main(void* arg) {
 }
 #endif
 
+/* nng sizes its pools by core count -- two task threads and one expire thread
+   per core, plus resolvers and a poller -- and every thread carries this
+   process's TLS, which is the 2 MiB of per-worker buffers. On a many-core node
+   the pools, not the work, set the footprint. The actor drives a few local
+   sockets, and the minimums serve that on any machine. Must precede the first
+   nng call. */
+static void fix_nng_threads(void) {
+#if NNG_MAJOR_VERSION == 1 && NNG_MINOR_VERSION >= 11
+    nng_init_set_parameter(NNG_INIT_NUM_TASK_THREADS,     2);
+    nng_init_set_parameter(NNG_INIT_NUM_EXPIRE_THREADS,   1);
+    nng_init_set_parameter(NNG_INIT_NUM_POLLER_THREADS,   1);
+    nng_init_set_parameter(NNG_INIT_NUM_RESOLVER_THREADS, 1);
+#endif
+}
+
 int actor_run(void) {
+    fix_nng_threads();
     if (cfg_load() < 0 || lanes_load() < 0) return -1;
 #ifdef _WIN32
     if (getenv("ACTOR_INIT") || services_requested() ||
