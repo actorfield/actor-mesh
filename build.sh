@@ -26,7 +26,7 @@ esac
 ZIG="${ZIG:-zig}"
 
 # --- config ---
-NNG_VERSION="1.9.0"
+NNG_VERSION="1.12.3"
 LMDB_VERSION="0.9.33"
 
 CFLAGS="-Wall -Wextra -O2 -std=c11 -I$ROOT/runtime"

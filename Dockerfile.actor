@@ -1,5 +1,26 @@
+# nng is built from source, pinned. Alpine 3.24 ships 1.11; 1.12.3 carries the
+# websocket and allocation-limit fixes that matter once the bus listens on
+# ws://. Static, so the image needs no nng package at run time. CPATH and
+# LIBRARY_PATH point gcc at it, so the build lines below stay as they are.
+FROM alpine:3.24 AS nng
+ARG NNG_VERSION=1.12.3
+ARG NNG_SHA256=036a925790034efdeef8a6803f3e4402c3ab509383326f8bc2f15ecee75a2fa2
+RUN apk add --no-cache gcc musl-dev cmake make curl
+RUN curl -fsSL -o /tmp/nng.tar.gz \
+        "https://github.com/nanomsg/nng/archive/refs/tags/v${NNG_VERSION}.tar.gz" && \
+    echo "${NNG_SHA256}  /tmp/nng.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/nng.tar.gz -C /tmp && \
+    cmake -S "/tmp/nng-${NNG_VERSION}" -B /tmp/nng-build \
+        -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+        -DNNG_TESTS=OFF -DNNG_TOOLS=OFF \
+        -DCMAKE_INSTALL_PREFIX=/opt/nng -DCMAKE_INSTALL_LIBDIR=lib && \
+    cmake --build /tmp/nng-build -j "$(nproc)" && \
+    cmake --install /tmp/nng-build
+
 FROM alpine:3.24 AS builder
-RUN apk add --no-cache gcc musl-dev nng-dev lmdb-dev
+RUN apk add --no-cache gcc musl-dev lmdb-dev
+COPY --from=nng /opt/nng /opt/nng
+ENV CPATH=/opt/nng/include LIBRARY_PATH=/opt/nng/lib
 
 # ── Actor runtime ──────────────────────────────────────────────────
 COPY runtime/ /src/runtime/
@@ -25,7 +46,7 @@ RUN mkdir -p /handlers && \
     strip /handlers/echo
 
 FROM alpine:3.24
-RUN apk add --no-cache nng lmdb
+RUN apk add --no-cache lmdb
 COPY --from=builder /actor /actor
 COPY --from=builder /actor-confine /actor-confine
 COPY --from=builder /handlers/echo /handlers/echo

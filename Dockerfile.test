@@ -1,6 +1,25 @@
 # Mirrors Dockerfile.actor's base and deps, plus what the tests need.
+# nng from source, pinned and static -- see Dockerfile.actor. CPATH and
+# LIBRARY_PATH also cover the Makefile's test targets run in this image.
+FROM alpine:3.24 AS nng
+ARG NNG_VERSION=1.12.3
+ARG NNG_SHA256=036a925790034efdeef8a6803f3e4402c3ab509383326f8bc2f15ecee75a2fa2
+RUN apk add --no-cache gcc musl-dev cmake make curl
+RUN curl -fsSL -o /tmp/nng.tar.gz \
+        "https://github.com/nanomsg/nng/archive/refs/tags/v${NNG_VERSION}.tar.gz" && \
+    echo "${NNG_SHA256}  /tmp/nng.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/nng.tar.gz -C /tmp && \
+    cmake -S "/tmp/nng-${NNG_VERSION}" -B /tmp/nng-build \
+        -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+        -DNNG_TESTS=OFF -DNNG_TOOLS=OFF \
+        -DCMAKE_INSTALL_PREFIX=/opt/nng -DCMAKE_INSTALL_LIBDIR=lib && \
+    cmake --build /tmp/nng-build -j "$(nproc)" && \
+    cmake --install /tmp/nng-build
+
 FROM alpine:3.24
-RUN apk add --no-cache gcc musl-dev nng-dev lmdb-dev make iproute2 procps
+RUN apk add --no-cache gcc musl-dev lmdb-dev make iproute2 procps
+COPY --from=nng /opt/nng /opt/nng
+ENV CPATH=/opt/nng/include LIBRARY_PATH=/opt/nng/lib
 WORKDIR /src
 COPY runtime/ /src/runtime/
 COPY proxy/   /src/proxy/
