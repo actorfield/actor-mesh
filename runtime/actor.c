@@ -1388,7 +1388,23 @@ static void* worker_main(void* arg) {
 }
 #endif
 
+/* nng sizes its pools by core count -- two task threads and one expire thread
+   per core, plus resolvers and a poller -- and every thread carries this
+   process's TLS, which is the 2 MiB of per-worker buffers. On a many-core node
+   the pools, not the work, set the footprint. The actor drives a few local
+   sockets, and the minimums serve that on any machine. Must precede the first
+   nng call. */
+static void fix_nng_threads(void) {
+#if NNG_MAJOR_VERSION == 1 && NNG_MINOR_VERSION >= 11
+    nng_init_set_parameter(NNG_INIT_NUM_TASK_THREADS,     2);
+    nng_init_set_parameter(NNG_INIT_NUM_EXPIRE_THREADS,   1);
+    nng_init_set_parameter(NNG_INIT_NUM_POLLER_THREADS,   1);
+    nng_init_set_parameter(NNG_INIT_NUM_RESOLVER_THREADS, 1);
+#endif
+}
+
 int actor_run(void) {
+    fix_nng_threads();
     if (cfg_load() < 0 || lanes_load() < 0) return -1;
 #ifdef _WIN32
     if (getenv("ACTOR_INIT") || services_requested() ||
