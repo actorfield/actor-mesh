@@ -213,7 +213,11 @@ static int lanes_load(void) {
             if (!own) shared = l;
         }
         size_t used = strlen(l->topics);
-        snprintf(l->topics + used, sizeof(l->topics) - used, "%s%s", used ? "," : "", t);
+        int    n    = snprintf(l->topics + used, sizeof(l->topics) - used, "%s%s", used ? "," : "", t);
+        if (n < 0 || (size_t)n >= sizeof(l->topics) - used) {
+            fprintf(stderr, "[actor] a lane's topics do not fit in %d bytes\n", (int)sizeof(l->topics) - 1);
+            return -1;
+        }
     }
     if (g_nlanes == 0) {
         fprintf(stderr, "[actor] ACTOR_TOPIC names no topic\n");
@@ -318,9 +322,9 @@ static int nng_setup(void) {
             return -1;
         }
         if (dial_retry(l->sub, cfg.bus_sub, "sub") < 0) return -1;
-        char  list[256];
+        char  list[sizeof(l->topics)];
         char* save = NULL;
-        snprintf(list, sizeof(list), "%s", l->topics);
+        memcpy(list, l->topics, sizeof(list));
         for (char* t = strtok_r(list, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
             if ((rc = nng_socket_set(l->sub, NNG_OPT_SUB_SUBSCRIBE, t, strlen(t) + 1)) != 0) {
                 fprintf(stderr, "[actor] sub subscribe %s: %s\n", t, nng_strerror(rc));
