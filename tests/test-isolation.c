@@ -65,22 +65,27 @@ static pid_t sp_(char **a, char **e) {
     return p;
 }
 
-static void sendm(const char *topic, const char *payload) {
+/* chain, when non-zero, fills the tuple id and correlation id with that byte. */
+static void sendm_chain(const char *topic, const char *payload, uint8_t chain) {
     nng_socket s; nng_pub0_open(&s); nng_dial(s, PP, NULL, 0); ms(60);
     size_t pl = strlen(payload);
     if (pl > MAXPL) { FAIL("payload too large"); nng_close(s); return; }
     uint8_t f[256 + MAXPL]; memset(f, 0, sizeof(f));
     size_t tl = strlen(topic); if (tl > 31) tl = 31;
     memcpy(f, topic, tl);
+    memset(f + 32, chain, 16);
+    memset(f + 48, chain, 16);
     memcpy(f + 80, "test", 4);
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
     int64_t ns = ts.tv_sec * 1000000000LL + ts.tv_nsec;
     memcpy(f + 112, &ns, 8);
-    uint32_t pl2 = (uint32_t)pl; memcpy(f + 138, &pl2, 4);
+    uint32_t pl2 = (uint32_t)pl; memcpy(f + 132, &pl2, 4);
     memcpy(f + 256, payload, pl);
     nng_send(s, f, 256 + pl, 0);
     nng_close(s);
 }
+
+static void sendm(const char *topic, const char *payload) { sendm_chain(topic, payload, 0); }
 
 static pid_t start_proxy(void) {
     char *a[] = { "./bin/mesh-proxy", NULL };
@@ -132,13 +137,15 @@ static int drain(nng_socket s, int budget, char *first, size_t cap) {
     return got;
 }
 
-static nng_socket sub_done(void) {
+static nng_socket sub_topic(const char *topic) {
     nng_socket s; nng_sub0_open(&s); nng_dial(s, SP, NULL, 0);
-    nng_socket_set(s, NNG_OPT_SUB_SUBSCRIBE, "done", 5);
+    nng_socket_set(s, NNG_OPT_SUB_SUBSCRIBE, topic, strlen(topic) + 1);
     nng_socket_set_ms(s, NNG_OPT_RECVTIMEO, 120);
     ms(150);
     return s;
 }
+
+static nng_socket sub_done(void) { return sub_topic("done"); }
 
 static void stop(pid_t proxy, pid_t actor) {
     if (actor > 0) { kill(actor, SIGKILL); waitpid(actor, NULL, 0); }
@@ -300,6 +307,16 @@ static void t_failing_handler_still_fails(void) {
     stop(pp, ap);
 }
 
+/* Root here is the root RLIMIT_NPROC exempts: uid 0 of the initial user
+   namespace, not of a rootless container. */
+static int init_userns(void) {
+    FILE *f = fopen("/proc/self/uid_map", "r");
+    unsigned in = 1, out = 1, count = 0;
+    int got = f ? fscanf(f, "%u %u %u", &in, &out, &count) : 0;
+    if (f) fclose(f);
+    return got == 3 && in == 0 && out == 0 && count == 4294967295u;
+}
+
 /* RLIMIT_NPROC is the one limit whose correct value depends on what else the
    REAL uid is already running: the kernel counts every process and thread for
    that uid system wide, not just this actor's. On a machine where the uid also
@@ -314,6 +331,10 @@ static void t_failing_handler_still_fails(void) {
 static void t_nproc_ordering(void) {
     TEST("ACTOR_RLIMIT_NPROC above current usage: actor still serves tuples");
     cleanup();
+    if (geteuid() == 0 && init_userns()) {
+        printf("  SKIP: root is exempt from RLIMIT_NPROC (see the fails-closed case)\n");
+        return;
+    }
 
     /* Current processes+threads for this uid, plus generous headroom. */
     int cur = 0;
@@ -362,6 +383,30 @@ static void t_nproc_below_usage_fails(void) {
     nng_close(s);
     CHECK(got == 0, "actor served a tuple despite an NPROC limit it cannot satisfy");
     stop(pp, ap);
+}
+
+/* Root is exempt from RLIMIT_NPROC, so a limit set with no ACTOR_UID to drop
+   to would do nothing. The actor must refuse to start, not run believing it
+   is limited. */
+static void t_nproc_exempt_fails_closed(void) {
+    TEST("ACTOR_RLIMIT_NPROC as root, with no ACTOR_UID, fails closed");
+    cleanup();
+    if (geteuid() != 0 || !init_userns()) {
+        printf("  SKIP: needs root in the initial user namespace, the case the kernel exempts\n");
+        return;
+    }
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso8b; mkdir -p /tmp/iso8b");
+    char *extra[] = { (char *)"ACTOR_RLIMIT_NPROC=100000" };
+    pid_t ap = start_actor("sh -c 'echo done; echo ok'", "/tmp/iso8b", extra, 1);
+    int gone = exited(ap);
+    nng_socket s = sub_done();
+    sendm("work", "x");
+    int got = drain(s, 1200, NULL, 0);
+    nng_close(s);
+    CHECK(gone, "actor started with an NPROC limit the kernel will not enforce");
+    CHECK(got == 0, "actor served a tuple under an NPROC limit that does nothing");
+    stop(pp, gone ? -1 : ap);
 }
 
 
@@ -808,6 +853,47 @@ static void t_pidns_no_survivors(void) {
     CHECK(access("/tmp/iso17/mark", F_OK) != 0,
           "a background child outlived its tuple's namespace");
     stop(pp, ap);
+}
+
+/* How many processes have exactly these args. */
+static int procs_named(const char *args) {
+    char cmd[256];
+    snprintf(cmd, sizeof cmd, "ps -eo args | grep -cx '%s'", args);
+    FILE *f = popen(cmd, "r");
+    int n = -1;
+    if (f) { if (fscanf(f, "%d", &n) != 1) n = -1; pclose(f); }
+    return n;
+}
+
+/* _term reaches into a handler's pid namespace. The pid the actor forked only
+   waits for the namespace's init, and that init ignores SIGTERM from outside
+   -- here the handler ignores it too. The process group spans all of them. */
+static void t_pidns_term(void) {
+    TEST("pid ns: _term stops the handler and everything in its namespace");
+    cleanup();
+    if (!pidns_available()) {
+        printf("  SKIP: no unprivileged pid namespace on this host\n");
+        return;
+    }
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/iso18; mkdir -p /tmp/iso18");
+    char *extra[] = { (char *)"ACTOR_TUPLE_UNSHARE=pid", (char *)"ACTOR_TERM_GRACE_MS=500" };
+    pid_t ap = start_actor("sh -c 'trap \"\" TERM; sleep 33 & sleep 33'", "/tmp/iso18", extra, 2);
+    ms(900);
+    nng_socket rej = sub_topic("tuple_rejected");
+    sendm_chain("work", "x", 0x31);
+    ms(500);
+    int before = procs_named("sleep 33");
+    sendm_chain("_term", "", 0x31);
+    char reason[512] = {0};
+    int got = drain(rej, 3000, reason, sizeof(reason));
+    nng_close(rej);
+    int after = procs_named("sleep 33");
+    stop(pp, ap);
+    system("pkill -9 -x sleep 2>/dev/null");
+    printf("  sleeps %d -> %d, rejected=%d %.80s\n", before, after, got, reason);
+    CHECK(got == 1 && strstr(reason, "terminated") != NULL, "not reported as terminated");
+    CHECK(before == 2 && after == 0, "a process in the handler's namespace survived _term");
 }
 
 /* Concurrent tuples must not share a namespace: each handler is pid 1 of its
@@ -1419,6 +1505,7 @@ int main(void) {
     t_failing_handler_still_fails();
     t_nproc_ordering();
     t_nproc_below_usage_fails();
+    t_nproc_exempt_fails_closed();
     t_landlock_allows_handler();
     t_landlock_denies_outside();
     t_landlock_lmdb_outside_fails();
@@ -1431,6 +1518,7 @@ int main(void) {
     t_tuple_absent_unchanged();
     t_pidns_fresh_per_tuple();
     t_pidns_no_survivors();
+    t_pidns_term();
     t_pidns_concurrent();
     t_pidns_failure_still_fails();
     t_tuple_unknown_ns_fails();

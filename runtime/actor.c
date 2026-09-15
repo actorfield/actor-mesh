@@ -14,6 +14,7 @@
 #include "actor.h"
 #include "actor_tuple.h"
 #include "actor_uuid.h"
+#include "bus.h"
 #ifndef _WIN32
 #  include "actor_isolation.h"
 #endif
@@ -23,12 +24,14 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <stdatomic.h>
+#include <stdbool.h>
 #include <errno.h>
 #include <time.h>
-#include <sys/wait.h>
 
 #ifndef _WIN32
 #  include <pthread.h>
+#  include <sys/wait.h>
 #endif
 
 #ifdef _WIN32
@@ -101,6 +104,7 @@ typedef struct {
     int         heartbeat_ms;
     int         retry_max;
     int         concurrency;
+    int         term_grace_ms;
 } actor_cfg_t;
 
 static actor_cfg_t cfg;
@@ -133,6 +137,10 @@ static int cfg_load(void) {
     const char* rm = getenv("ACTOR_RETRY_MAX");
     cfg.retry_max = rm ? atoi(rm) : 3;
 
+    const char* tg = getenv("ACTOR_TERM_GRACE_MS");
+    cfg.term_grace_ms = tg ? atoi(tg) : 5000;
+    if (cfg.term_grace_ms < 0) cfg.term_grace_ms = 0;
+
     /* Default 1 = the historical single-message-at-a-time behaviour, so an
        existing deployment gets exactly what it had until it opts in. */
     const char* cc = getenv("ACTOR_CONCURRENCY");
@@ -148,10 +156,106 @@ static int cfg_load(void) {
     return 0;
 }
 
+/* ── Lanes ───────────────────────────────────────────────────────────────── */
+
+/* A lane is a set of topics served by one handler, with its own socket and
+   workers. Topics without an ACTOR_{HANDLER,RESULT_TOPIC,CONCURRENCY}_<topic>
+   setting share the default lane; a topic with one gets a lane of its own, so
+   it never waits behind the others. With no such settings there is one lane:
+   the actor as it always was. */
+#define ACTOR_MAX_LANES 16
+
+typedef struct {
+    char        topics[256];   /* comma-separated, as subscribed */
+    const char* handler;
+    const char* result_topic;
+    int         concurrency;
+    nng_socket  sub;
+} lane_t;
+
+static lane_t g_lanes[ACTOR_MAX_LANES];
+static int    g_nlanes;
+
+static const char* topic_env(const char* name, const char* topic) {
+    char key[64];
+    snprintf(key, sizeof(key), "%s_%s", name, topic);
+    return getenv(key);
+}
+
+static int lanes_load(void) {
+    char list[256];
+    snprintf(list, sizeof(list), "%s", cfg.topic);
+    lane_t* shared = NULL;
+    int     total  = 0;
+    char*   save   = NULL;
+    for (char* t = strtok_r(list, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
+        while (*t == ' ') t++;
+        if (!*t) continue;
+        const char* h  = topic_env("ACTOR_HANDLER", t);
+        const char* rt = topic_env("ACTOR_RESULT_TOPIC", t);
+        const char* cc = topic_env("ACTOR_CONCURRENCY", t);
+        bool        own = h || rt || cc;
+        lane_t*     l   = own ? NULL : shared;
+        if (!l) {
+            if (g_nlanes == ACTOR_MAX_LANES) {
+                fprintf(stderr, "[actor] ACTOR_TOPIC needs more than %d lanes\n", ACTOR_MAX_LANES);
+                return -1;
+            }
+            l = &g_lanes[g_nlanes++];
+            l->handler      = h  ? h  : cfg.handler;
+            l->result_topic = rt ? rt : cfg.result_topic;
+            l->concurrency  = cfg.concurrency;
+            if (cc) {
+                l->concurrency = atoi(cc);
+                if (l->concurrency < 1) l->concurrency = 1;
+            }
+            total += l->concurrency;
+            if (!own) shared = l;
+        }
+        size_t used = strlen(l->topics);
+        snprintf(l->topics + used, sizeof(l->topics) - used, "%s%s", used ? "," : "", t);
+    }
+    if (g_nlanes == 0) {
+        fprintf(stderr, "[actor] ACTOR_TOPIC names no topic\n");
+        return -1;
+    }
+    if (total > ACTOR_MAX_CONCURRENCY) {
+        fprintf(stderr, "[actor] lanes ask for %d workers; the most is %d\n",
+                total, ACTOR_MAX_CONCURRENCY);
+        return -1;
+    }
+#ifdef _WIN32
+    if (g_nlanes > 1) {
+        fprintf(stderr, "[actor] per-topic lanes need more than one worker, which Windows lacks\n");
+        return -1;
+    }
+#endif
+    return 0;
+}
+
+/* The lane serving a header's topic; lane 0 if none does any more. */
+static int lane_of(const char topic[32]) {
+    char t[33];
+    snprintf(t, sizeof(t), "%.*s", 32, topic);
+    size_t n = strlen(t);
+    for (int i = 0; i < g_nlanes; i++) {
+        for (const char* p = g_lanes[i].topics; *p; ) {
+            const char* e   = strchr(p, ',');
+            size_t      len = e ? (size_t)(e - p) : strlen(p);
+            if (len == n && memcmp(p, t, n) == 0) return i;
+            if (!e) break;
+            p = e + 1;
+        }
+    }
+    return 0;
+}
+
 /* ── State ───────────────────────────────────────────────────────────────── */
 
 static nng_socket nng_pub;
-static nng_socket nng_sub;
+#ifndef _WIN32
+static nng_socket nng_ctl;   /* control topics, read by the reaper */
+#endif
 static MDB_env*   mdb_env;
 static MDB_dbi    dbi_inbox;
 static MDB_dbi    dbi_outbox;
@@ -159,11 +263,40 @@ static MDB_dbi    dbi_state;
 
 static volatile sig_atomic_t g_stop = 0;
 
+/* Inbox entries left by the previous run, replayed before new messages, each
+   by the lane its topic belongs to. */
+static uint8_t    g_replay[ACTOR_MAX_CONCURRENCY][16];
+static int        g_replay_lane[ACTOR_MAX_CONCURRENCY];
+static atomic_int g_replay_taken[ACTOR_MAX_CONCURRENCY];
+static int        g_replay_n;
+static atomic_int g_replay_left;
+
+/* Where a worker's frame came from. A replayed one lives in g_frame_buf and
+   is already in the inbox. */
+typedef enum { TUPLE_RECEIVED, TUPLE_REPLAYED } tuple_source_t;
+
+static int64_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
 /* ── Signal ──────────────────────────────────────────────────────────────── */
 
 static void on_signal(int s) { (void)s; g_stop = 1; }
 
 /* ── NNG ─────────────────────────────────────────────────────────────────── */
+
+/* The proxy may not be listening yet. */
+static int dial_retry(nng_socket s, const char* url, const char* what) {
+    for (int i = 0; i < 30; i++) {
+        int rc = nng_dial(s, url, NULL, 0);
+        if (rc == 0) return 0;
+        fprintf(stderr, "[actor] %s dial %s: %s (retry %d)\n", what, url, nng_strerror(rc), i);
+        sleep(1);
+    }
+    return -1;
+}
 
 static int nng_setup(void) {
     int rc;
@@ -172,49 +305,40 @@ static int nng_setup(void) {
         fprintf(stderr, "[actor] nng_pub0_open: %s\n", nng_strerror(rc));
         return -1;
     }
-    /* retry dial — proxy may not be listening yet */
-    for (int i = 0; i < 30; i++) {
-        rc = nng_dial(nng_pub, cfg.bus_pub, NULL, 0);
-        if (rc == 0) break;
-        fprintf(stderr, "[actor] pub dial %s: %s (retry %d)\n",
-                cfg.bus_pub, nng_strerror(rc), i);
-        sleep(1);
-    }
-    if (rc != 0) return -1;
+    if (dial_retry(nng_pub, cfg.bus_pub, "pub") < 0) return -1;
 
-    if ((rc = nng_sub0_open(&nng_sub)) != 0) {
-        fprintf(stderr, "[actor] nng_sub0_open: %s\n", nng_strerror(rc));
-        return -1;
-    }
-    for (int i = 0; i < 30; i++) {
-        rc = nng_dial(nng_sub, cfg.bus_sub, NULL, 0);
-        if (rc == 0) break;
-        fprintf(stderr, "[actor] sub dial %s: %s (retry %d)\n",
-                cfg.bus_sub, nng_strerror(rc), i);
-        sleep(1);
-    }
-    if (rc != 0) return -1;
-
-    /* ACTOR_TOPIC supports comma-separated list: "user_message,sql_result"
-     * NNG sub0 does prefix matching on the message body. The topic field
-     * is at offset 0 of actor_header_t, so subscribe with null-terminated
-     * topic string for exact (non-prefix) match. */
-    char topic_buf[256];
-    strncpy(topic_buf, cfg.topic, sizeof(topic_buf) - 1);
-    topic_buf[sizeof(topic_buf) - 1] = '\0';
-    char *saveptr; char* tok = strtok_r(topic_buf, ",", &saveptr);
-    while (tok) {
-        while (*tok == ' ') tok++;
-        size_t tlen = strlen(tok) + 1;  /* include null for exact match */
-        if ((rc = nng_socket_set(nng_sub, NNG_OPT_SUB_SUBSCRIBE, tok, tlen)) != 0) {
-            fprintf(stderr, "[actor] sub subscribe %s: %s\n", tok, nng_strerror(rc));
+    /* One SUB socket per lane. NNG sub0 prefix-matches on the message body and
+     * the topic sits at offset 0 of actor_header_t, so each topic is subscribed
+     * with its null terminator for an exact match. The 100ms receive timeout is
+     * how a worker notices g_stop. */
+    for (int i = 0; i < g_nlanes; i++) {
+        lane_t* l = &g_lanes[i];
+        if ((rc = nng_sub0_open(&l->sub)) != 0) {
+            fprintf(stderr, "[actor] nng_sub0_open: %s\n", nng_strerror(rc));
             return -1;
         }
-        tok = strtok_r(NULL, ",", &saveptr);
+        if (dial_retry(l->sub, cfg.bus_sub, "sub") < 0) return -1;
+        char  list[256];
+        char* save = NULL;
+        snprintf(list, sizeof(list), "%s", l->topics);
+        for (char* t = strtok_r(list, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
+            if ((rc = nng_socket_set(l->sub, NNG_OPT_SUB_SUBSCRIBE, t, strlen(t) + 1)) != 0) {
+                fprintf(stderr, "[actor] sub subscribe %s: %s\n", t, nng_strerror(rc));
+                return -1;
+            }
+        }
+        nng_socket_set_ms(l->sub, NNG_OPT_RECVTIMEO, 100);
     }
 
-    /* set recv timeout for heartbeat check granularity (100ms) */
-    nng_socket_set_ms(nng_sub, NNG_OPT_RECVTIMEO, 100);
+#ifndef _WIN32
+    /* Its own socket, so a _term still arrives when every worker is busy. */
+    if ((rc = nng_sub0_open(&nng_ctl)) != 0 ||
+        (rc = nng_dial(nng_ctl, cfg.bus_sub, NULL, 0)) != 0 ||
+        (rc = nng_socket_set(nng_ctl, NNG_OPT_SUB_SUBSCRIBE, "_term", sizeof("_term"))) != 0) {
+        fprintf(stderr, "[actor] control socket: %s\n", nng_strerror(rc));
+        return -1;
+    }
+#endif
 
     return 0;
 }
@@ -237,6 +361,24 @@ static int lmdb_setup(void) {
     mdb_dbi_open(txn, "inbox",  MDB_CREATE, &dbi_inbox);
     mdb_dbi_open(txn, "outbox", MDB_CREATE, &dbi_outbox);
     mdb_dbi_open(txn, "state",  MDB_CREATE, &dbi_state);
+
+    /* The inbox holds what the last run had in flight -- at most one tuple
+       per worker. Replaying it covers any outbox copy, so drop those. */
+    mdb_drop(txn, dbi_outbox, 0);
+    MDB_cursor*   cur;
+    MDB_val       k, v;
+    MDB_cursor_op op = MDB_FIRST;
+    if (mdb_cursor_open(txn, dbi_inbox, &cur) == 0) {
+        while (g_replay_n < ACTOR_MAX_CONCURRENCY && mdb_cursor_get(cur, &k, &v, op) == 0) {
+            op = MDB_NEXT;
+            if (k.mv_size != 16) continue;
+            memcpy(g_replay[g_replay_n], k.mv_data, 16);
+            g_replay_lane[g_replay_n++] = v.mv_size >= sizeof(actor_header_t)
+                ? lane_of(((const actor_header_t*)v.mv_data)->topic) : 0;
+        }
+        mdb_cursor_close(cur);
+    }
+    atomic_store(&g_replay_left, g_replay_n);
     mdb_txn_commit(txn);
     return 0;
 }
@@ -285,16 +427,39 @@ typedef struct {
        null-terminated string, so a topic occupying all 32 bytes needs one
        more byte to terminate. */
     char topic[33];
+    char deadline[21];   /* emitted_at + ttl, unix ns; "0" = none */
 } child_env_t;
 
+/* How one handler run ended. */
+typedef enum {
+    RUN_OK,         /* exited 0; *out_len bytes of output are in out */
+    RUN_FAILED,     /* could not start, exited non-zero, or was killed */
+    RUN_TOO_LARGE,  /* output exceeded ACTOR_MAX_PAYLOAD */
+    RUN_TERMINATED, /* stopped by _term */
+} run_status_t;
+
 /* platform_spawn launches the handler, pipes payload to its stdin,
- * reads result from its stdout, returns the length or error.
+ * reads its stdout into out, and says how the run ended.
  * Unix: fork/exec   Windows: CreateProcess */
 #ifdef _WIN32
 
-static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
-                              uint8_t*       out, size_t out_cap,
-                              const child_env_t* env) {
+static void running_json(char* out, size_t cap) { snprintf(out, cap, "[]"); }
+static void services_json(char* out, size_t cap) { snprintf(out, cap, "[]"); }
+
+static bool services_requested(void) {
+    char* env   = GetEnvironmentStringsA();
+    bool  found = false;
+    for (char* p = env; p && *p; p += strlen(p) + 1)
+        if (strncmp(p, "ACTOR_SERVICE_", 14) == 0) { found = true; break; }
+    if (env) FreeEnvironmentStringsA(env);
+    return found;
+}
+
+static run_status_t platform_spawn(const uint8_t* in,  size_t in_len,
+                                   uint8_t*       out, size_t out_cap,
+                                   const child_env_t* env, const actor_header_t* hdr,
+                                   const char* handler, size_t* out_len) {
+    (void)hdr;   /* _term is Unix-only: it needs process groups */
     /* Windows runs a single worker (cfg_load clamps concurrency to 1 there),
        so mutating the process environment before CreateProcess is safe. */
     SetEnvironmentVariableA("ACTOR_TUPLE_ID",       env->id_hex);
@@ -303,24 +468,26 @@ static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
     SetEnvironmentVariableA("ACTOR_TUPLE_ORIGIN",   env->origin);
     SetEnvironmentVariableA("ACTOR_ATTEMPT",        env->attempt);
     SetEnvironmentVariableA("ACTOR_TUPLE_TOPIC",    env->topic);
+    SetEnvironmentVariableA("ACTOR_TUPLE_DEADLINE", env->deadline);
     HANDLE stdin_rd  = NULL, stdin_wr  = NULL;
     HANDLE stdout_rd = NULL, stdout_wr = NULL;
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
-    ssize_t result = -1;
+    run_status_t result = RUN_FAILED;
 
-    if (!CreatePipe(&stdin_rd,  &stdin_wr,  &sa, 0)) return -1;
+    if (!CreatePipe(&stdin_rd,  &stdin_wr,  &sa, 0)) return RUN_FAILED;
     if (!CreatePipe(&stdout_rd, &stdout_wr, &sa, 0)) goto fail_stdin;
     SetHandleInformation(stdin_wr,  HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(stdout_rd, HANDLE_FLAG_INHERIT, 0);
 
-    STARTUPINFOA si = { sizeof(si) };
+    STARTUPINFOA si = {0};
+    si.cb         = sizeof(si);
     si.hStdInput  = stdin_rd;
     si.hStdOutput = stdout_wr;
     si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
     si.dwFlags    = STARTF_USESTDHANDLES;
 
     char cmdline[1024];
-    snprintf(cmdline, sizeof(cmdline), "cmd.exe /c %s", cfg.handler);
+    snprintf(cmdline, sizeof(cmdline), "cmd.exe /c %s", handler);
 
     PROCESS_INFORMATION pi = {0};
     if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
@@ -344,15 +511,16 @@ static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
         if (len == out_cap) {
             uint8_t drain[256]; DWORD d;
             while (ReadFile(stdout_rd, drain, sizeof(drain), &d, NULL) && d > 0) {}
-            result = -2;
+            result = RUN_TOO_LARGE;
             goto fail_proc;
         }
     }
-    result = (ssize_t)len;
+    *out_len = len;
+    result = RUN_OK;
 
     WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD ec;
-    if (GetExitCodeProcess(pi.hProcess, &ec) && ec != 0) result = -1;
+    if (GetExitCodeProcess(pi.hProcess, &ec) && ec != 0) result = RUN_FAILED;
 
 fail_proc:
     CloseHandle(pi.hProcess);
@@ -396,19 +564,291 @@ fail_stdin:
  */
 
 typedef struct {
-    pid_t pid;      /* 0 = free slot                        */
-    int   status;   /* raw waitpid status, valid when done  */
-    int   done;     /* set by the reaper                    */
+    pid_t   pid;                 /* 0 = free slot; also its process group */
+    int     status;              /* raw waitpid status, valid when done   */
+    int     done;                /* set by the reaper                     */
+    uint8_t tuple_id[16];        /* what it is running, for _term         */
+    uint8_t correlation_id[16];
+    char    topic[33];
+    int64_t started_ms;          /* monotonic, for the heartbeat          */
+    bool    terminated;          /* _term has sent SIGTERM                */
+    int64_t kill_at_ms;          /* SIGKILL deadline, 0 = none            */
 } child_slot_t;
 
 static child_slot_t   g_children[ACTOR_MAX_CONCURRENCY];
 static pthread_mutex_t child_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  child_cv = PTHREAD_COND_INITIALIZER;
+static atomic_int      g_reaper_stop;   /* set once every worker has returned */
+
+static void heartbeat_tick(void);
+
+static bool id_is_zero(const uint8_t id[16]) {
+    for (int i = 0; i < 16; i++) if (id[i]) return false;
+    return true;
+}
+
+/* _term: SIGTERM the process group of every running handler in the named
+   correlation chain -- or only the named tuple, when causation_id is set --
+   and leave escalate_kills to SIGKILL what remains after the grace. */
+static void term_matching(const actor_header_t* req) {
+    if (id_is_zero(req->correlation_id)) return;
+    bool one = !id_is_zero(req->causation_id);
+    pthread_mutex_lock(&child_mu);
+    for (int i = 0; i < ACTOR_MAX_CONCURRENCY; i++) {
+        child_slot_t* c = &g_children[i];
+        if (!c->pid || c->done || c->terminated) continue;
+        if (memcmp(c->correlation_id, req->correlation_id, 16) != 0) continue;
+        if (one && memcmp(c->tuple_id, req->causation_id, 16) != 0) continue;
+        kill(-c->pid, SIGTERM);
+        c->terminated = true;
+        c->kill_at_ms = mono_ms() + cfg.term_grace_ms;
+    }
+    pthread_mutex_unlock(&child_mu);
+}
+
+/* Only the header matters, so a fixed buffer is enough: nng_recv copies what
+   fits and reports the full length. */
+static void control_poll(void) {
+    uint8_t buf[sizeof(actor_header_t)];
+    size_t  sz = sizeof(buf);
+    while (nng_recv(nng_ctl, buf, &sz, NNG_FLAG_NONBLOCK) == 0) {
+        if (sz >= sizeof(actor_header_t)) term_matching((const actor_header_t*)buf);
+        sz = sizeof(buf);
+    }
+}
+
+static void escalate_kills(void) {
+    int64_t now = mono_ms();
+    pthread_mutex_lock(&child_mu);
+    for (int i = 0; i < ACTOR_MAX_CONCURRENCY; i++) {
+        child_slot_t* c = &g_children[i];
+        if (c->pid && !c->done && c->kill_at_ms && now >= c->kill_at_ms) {
+            kill(-c->pid, SIGKILL);
+            c->kill_at_ms = 0;
+        }
+    }
+    pthread_mutex_unlock(&child_mu);
+}
+
+/* The running handlers, as the heartbeat's JSON array. Stops at a whole
+   entry if cap is reached, so the array is always valid. */
+static void running_json(char* out, size_t cap) {
+    size_t  n   = 0;
+    int64_t now = mono_ms();
+    out[n++] = '[';
+    pthread_mutex_lock(&child_mu);
+    for (int i = 0; i < ACTOR_MAX_CONCURRENCY; i++) {
+        const child_slot_t* c = &g_children[i];
+        if (!c->pid || c->done) continue;
+        char tid[33], cid[33];
+        actor_uuid_hex(c->tuple_id,       tid);
+        actor_uuid_hex(c->correlation_id, cid);
+        int w = snprintf(out + n, cap - n,
+                         "%s{\"tuple\":\"%s\",\"correlation\":\"%s\",\"topic\":\"%s\","
+                         "\"pid\":%d,\"age_ms\":%lld,\"terminating\":%s}",
+                         n > 1 ? "," : "", tid, cid, c->topic, (int)c->pid,
+                         (long long)(now - c->started_ms), c->terminated ? "true" : "false");
+        if (w < 0 || (size_t)w >= cap - n - 1) break;   /* keep room for ']' */
+        n += (size_t)w;
+    }
+    pthread_mutex_unlock(&child_mu);
+    out[n++] = ']';
+    out[n]   = '\0';
+}
+
+/* ── Services ──────────────────────────────────────────────────────────────
+ *
+ * A handler lives for one tuple; a service lives as long as the actor.
+ * ACTOR_SERVICE_<name>=<command> is started before any tuple is served and
+ * restarted by the reaper when it exits. More than SERVICE_RESTARTS restarts
+ * inside SERVICE_WINDOW_MS and the actor gives up and exits non-zero, so
+ * whatever supervises it backs off rather than watching it spin. */
+#define ACTOR_MAX_SERVICES 8
+#define SERVICE_RESTARTS   5
+#define SERVICE_WINDOW_MS  60000
+
+typedef struct {
+    char        name[32];
+    const char* cmd;
+    pid_t       pid;                        /* 0 = not running; also its group */
+    int         restarts;
+    int64_t     recent[SERVICE_RESTARTS];   /* when the last restarts happened */
+} service_t;
+
+static service_t  g_services[ACTOR_MAX_SERVICES];
+static int        g_nservices;
+static atomic_int g_services_failed;
+
+extern char** environ;
+
+static int services_load(void) {
+    static const char prefix[] = "ACTOR_SERVICE_";
+    const size_t      plen     = sizeof(prefix) - 1;
+    for (char** e = environ; *e; e++) {
+        const char* eq = strchr(*e, '=');
+        if (strncmp(*e, prefix, plen) != 0 || !eq || !eq[1]) continue;
+        if (g_nservices == ACTOR_MAX_SERVICES) {
+            fprintf(stderr, "[actor] more than %d ACTOR_SERVICE_* entries\n", ACTOR_MAX_SERVICES);
+            return -1;
+        }
+        service_t* s = &g_services[g_nservices++];
+        snprintf(s->name, sizeof(s->name), "%.*s", (int)(eq - *e - plen), *e + plen);
+        s->cmd = eq + 1;
+    }
+    return 0;
+}
+
+static void service_spawn(service_t* s) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        setpgid(0, 0);
+        execl("/bin/sh", "sh", "-c", s->cmd, NULL);
+        _exit(127);
+    }
+    if (pid < 0) fprintf(stderr, "[actor] service %s: fork: %s\n", s->name, strerror(errno));
+    else         setpgid(pid, pid);
+    s->pid = pid > 0 ? pid : 0;
+}
+
+/* Reaper only: restart a service that exited, within its budget. */
+static void service_reaped(pid_t pid, int status) {
+    for (int i = 0; i < g_nservices; i++) {
+        service_t* s = &g_services[i];
+        if (s->pid != pid) continue;
+        s->pid = 0;
+        if (g_stop) return;
+        int64_t now    = mono_ms();
+        int     recent = 0;
+        for (int k = 0; k < SERVICE_RESTARTS; k++)
+            if (s->recent[k] && now - s->recent[k] < SERVICE_WINDOW_MS) recent++;
+        if (recent == SERVICE_RESTARTS) {
+            fprintf(stderr, "[actor] service %s restarted %d times in %ds; giving up\n",
+                    s->name, SERVICE_RESTARTS, SERVICE_WINDOW_MS / 1000);
+            atomic_store(&g_services_failed, 1);
+            g_stop = 1;
+            return;
+        }
+        s->recent[s->restarts++ % SERVICE_RESTARTS] = now;
+        fprintf(stderr, "[actor] service %s (pid %d) exited with status %d; restarting\n",
+                s->name, (int)pid,
+                WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status));
+        service_spawn(s);
+        return;
+    }
+}
+
+/* Reaper only, at shutdown: SIGTERM each service, SIGKILL after the grace. */
+static void services_stop(void) {
+    int64_t kill_at = mono_ms() + cfg.term_grace_ms;
+    bool    killed  = false;
+    for (int i = 0; i < g_nservices; i++)
+        if (g_services[i].pid) kill(-g_services[i].pid, SIGTERM);
+    for (;;) {
+        bool left = false;
+        for (int i = 0; i < g_nservices; i++) left |= g_services[i].pid != 0;
+        if (!left) return;
+        if (!killed && mono_ms() >= kill_at) {
+            for (int i = 0; i < g_nservices; i++)
+                if (g_services[i].pid) kill(-g_services[i].pid, SIGKILL);
+            killed = true;
+        }
+        int   st;
+        pid_t pid = waitpid(-1, &st, WNOHANG);
+        if (pid < 0 && errno == ECHILD) return;
+        if (pid > 0) {
+            for (int i = 0; i < g_nservices; i++)
+                if (g_services[i].pid == pid) g_services[i].pid = 0;
+            continue;
+        }
+        struct timespec ts = { 0, 5 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+}
+
+static void services_json(char* out, size_t cap) {
+    size_t n = 0;
+    out[n++] = '[';
+    for (int i = 0; i < g_nservices; i++) {
+        const service_t* s = &g_services[i];
+        int w = snprintf(out + n, cap - n, "%s{\"name\":\"%s\",\"pid\":%d,\"restarts\":%d}",
+                         n > 1 ? "," : "", s->name, (int)s->pid, s->restarts);
+        if (w < 0 || (size_t)w >= cap - n - 1) break;
+        n += (size_t)w;
+    }
+    out[n++] = ']';
+    out[n]   = '\0';
+}
+
+/* ACTOR_INIT runs once, to completion, before anything is served. A failure
+   stops the actor like any other startup step. */
+static int run_init(void) {
+    const char* cmd = getenv("ACTOR_INIT");
+    if (!cmd || !*cmd) return 0;
+    pid_t pid = fork();
+    if (pid == 0) {
+        execl("/bin/sh", "sh", "-c", cmd, NULL);
+        _exit(127);
+    }
+    int st = 0;
+    if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        fprintf(stderr, "[actor] ACTOR_INIT failed\n");
+        return -1;
+    }
+    return 0;
+}
+
+/* ── Built-in bus ──────────────────────────────────────────────────────────
+ *
+ * An actor given PROXY_SUB_BIND and PROXY_PUB_BIND hosts the bus itself, on a
+ * thread of its own, listening before anything here dials it and closing
+ * after everything else. */
+static bus_t      g_bus;
+static pthread_t  g_bus_thread;
+static bool       g_bus_hosted;
+static atomic_int g_bus_stop;
+
+static void* bus_main(void* arg) {
+    (void)arg;
+    while (!atomic_load(&g_bus_stop)) bus_forward_once(&g_bus);
+    return NULL;
+}
+
+static int bus_host(void) {
+    const char* sub = getenv("PROXY_SUB_BIND");
+    const char* pub = getenv("PROXY_PUB_BIND");
+    if (!sub && !pub) return 0;
+    if (!sub || !pub) {
+        fprintf(stderr, "[actor] hosting the bus needs both PROXY_SUB_BIND and PROXY_PUB_BIND\n");
+        return -1;
+    }
+    int rc = bus_open(&g_bus, sub, pub);
+    if (rc != 0) {
+        fprintf(stderr, "[actor] bus: %s\n", nng_strerror(rc));
+        return -1;
+    }
+    if (pthread_create(&g_bus_thread, NULL, bus_main, NULL) != 0) {
+        fprintf(stderr, "[actor] could not start the bus thread\n");
+        bus_close(&g_bus);
+        return -1;
+    }
+    g_bus_hosted = true;
+    return 0;
+}
+
+static void bus_unhost(void) {
+    if (!g_bus_hosted) return;
+    atomic_store(&g_bus_stop, 1);
+    pthread_join(g_bus_thread, NULL);
+    bus_close(&g_bus);
+}
 
 /* Reaper thread: the only caller of waitpid in the process. */
 static void* reaper_main(void* arg) {
     (void)arg;
-    while (!g_stop) {
+    while (!atomic_load(&g_reaper_stop)) {
+        control_poll();
+        escalate_kills();
+        heartbeat_tick();
         int   status;
         pid_t pid = waitpid(-1, &status, WNOHANG);
         if (pid <= 0) {
@@ -431,45 +871,43 @@ static void* reaper_main(void* arg) {
            was the whole job -- nothing to dispatch. */
         pthread_cond_broadcast(&child_cv);
         pthread_mutex_unlock(&child_mu);
+        service_reaped(pid, status);
     }
+    services_stop();
     return NULL;
 }
 
-/* Block until the reaper reports `slot`'s child, then free the slot.
-   Returns the raw waitpid status. */
-static int await_child(int slot) {
+typedef struct {
+    int  status;       /* raw waitpid status */
+    bool terminated;   /* stopped by _term   */
+} child_exit_t;
+
+/* Block until the reaper reports `slot`'s child, then free the slot. */
+static child_exit_t await_child(int slot) {
     pthread_mutex_lock(&child_mu);
-    while (!g_children[slot].done) {
-        /* Timed wait so shutdown cannot leave a worker parked forever if the
-           reaper has already stopped. */
-        struct timespec until;
-        clock_gettime(CLOCK_REALTIME, &until);
-        until.tv_nsec += 50 * 1000 * 1000;
-        if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
-        pthread_cond_timedwait(&child_cv, &child_mu, &until);
-        if (g_stop && !g_children[slot].done) {
-            /* Treat an interrupted wait as a failed run: retry/rejection is
-               the safe reading, never "succeeded". */
-            g_children[slot].pid = 0;
-            g_children[slot].done = 0;
-            pthread_mutex_unlock(&child_mu);
-            return -1;
-        }
-    }
-    int status = g_children[slot].status;
-    g_children[slot].pid  = 0;
-    g_children[slot].done = 0;
+    /* The reaper outlives every worker, so this always gets an answer. */
+    while (!g_children[slot].done)
+        pthread_cond_wait(&child_cv, &child_mu);
+    child_slot_t* c = &g_children[slot];
+    child_exit_t  e = { c->status, c->terminated };
+    /* A terminated handler's leftovers go with it. */
+    if (c->terminated) kill(-c->pid, SIGKILL);
+    c->pid        = 0;
+    c->done       = 0;
+    c->terminated = false;
+    c->kill_at_ms = 0;
     pthread_mutex_unlock(&child_mu);
-    return status;
+    return e;
 }
 
-static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
-                              uint8_t*       out, size_t out_cap,
-                              const child_env_t* env) {
+static run_status_t platform_spawn(const uint8_t* in,  size_t in_len,
+                                   uint8_t*       out, size_t out_cap,
+                                   const child_env_t* env, const actor_header_t* hdr,
+                                   const char* handler, size_t* out_len) {
     int to_child[2], from_child[2];
 
-    if (pipe(to_child)   < 0) return -1;
-    if (pipe(from_child) < 0) { close(to_child[0]); close(to_child[1]); return -1; }
+    if (pipe(to_child)   < 0) return RUN_FAILED;
+    if (pipe(from_child) < 0) { close(to_child[0]); close(to_child[1]); return RUN_FAILED; }
 
     /* Claim a slot, then fork and register the pid without releasing the
        mutex -- see the dispatcher note above for why the two must be atomic
@@ -483,8 +921,8 @@ static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
         pthread_mutex_unlock(&child_mu);
         close(to_child[0]); close(to_child[1]);
         close(from_child[0]); close(from_child[1]);
-        fprintf(stderr, "[actor] no free child slot (concurrency=%d)\n", cfg.concurrency);
-        return -1;
+        fprintf(stderr, "[actor] no free child slot\n");
+        return RUN_FAILED;
     }
 
     pid_t pid = fork();
@@ -492,10 +930,13 @@ static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
         pthread_mutex_unlock(&child_mu);
         close(to_child[0]); close(to_child[1]);
         close(from_child[0]); close(from_child[1]);
-        return -1;
+        return RUN_FAILED;
     }
 
     if (pid == 0) {
+        /* Its own process group, so _term can signal the whole tree. */
+        setpgid(0, 0);
+
         /* Child. setenv happens HERE, after the fork, not in the parent before
            it: the parent may be several worker threads deep, and setenv mutates
            process-wide state, so stamping the environment in the parent would
@@ -512,6 +953,7 @@ static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
            tell them apart -- so a single actor could subscribe widely but not
            dispatch, and callers ran one actor per topic instead. */
         setenv("ACTOR_TUPLE_TOPIC",    env->topic,    1);
+        setenv("ACTOR_TUPLE_DEADLINE", env->deadline, 1);
 
         /* Per-tuple namespaces, before exec so they live and die with this one
            tuple. A failure here must not become a handler that runs anyway:
@@ -523,13 +965,19 @@ static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
         dup2(from_child[1], STDOUT_FILENO);
         close(to_child[0]); close(to_child[1]);
         close(from_child[0]); close(from_child[1]);
-        execl("/bin/sh", "sh", "-c", cfg.handler, NULL);
+        execl("/bin/sh", "sh", "-c", handler, NULL);
         _exit(1);
     }
 
-    g_children[slot].pid    = pid;
-    g_children[slot].done   = 0;
-    g_children[slot].status = 0;
+    setpgid(pid, pid);   /* the child does the same; whichever runs first wins */
+    child_slot_t* c = &g_children[slot];
+    c->pid    = pid;
+    c->done   = 0;
+    c->status = 0;
+    memcpy(c->tuple_id,       hdr->id,             16);
+    memcpy(c->correlation_id, hdr->correlation_id, 16);
+    snprintf(c->topic, sizeof(c->topic), "%.*s", 32, hdr->topic);
+    c->started_ms = mono_ms();
     pthread_mutex_unlock(&child_mu);
 
     close(to_child[0]);
@@ -539,7 +987,7 @@ static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
         close(to_child[1]);
         close(from_child[0]);
         await_child(slot);
-        return -1;
+        return RUN_FAILED;
     }
     close(to_child[1]);
 
@@ -554,46 +1002,52 @@ static ssize_t platform_spawn(const uint8_t* in,  size_t in_len,
             await_child(slot);
             fprintf(stderr, "[actor] result exceeded ACTOR_MAX_PAYLOAD=%d, dropping\n",
                     ACTOR_MAX_PAYLOAD);
-            return -2;
+            return RUN_TOO_LARGE;
         }
     }
     close(from_child[0]);
 
-    int status = await_child(slot);
-    if (status == -1) return -1;                        /* interrupted */
-    if (WIFEXITED(status) && WEXITSTATUS(status) != 0) return -1;
-    if (!WIFEXITED(status)) return -1;                  /* signalled — not a success */
+    child_exit_t e = await_child(slot);
+    if (e.terminated) return RUN_TERMINATED;
+    if (!WIFEXITED(e.status) || WEXITSTATUS(e.status) != 0) return RUN_FAILED;
 
-    return (ssize_t)len;
+    *out_len = len;
+    return RUN_OK;
 }
 
 #endif /* _WIN32 */
 
-/* invoke_handler: collect the per-message env, spawn handler, return result
- * length. The values travel as a value into platform_spawn, which applies them
+/* invoke_handler: collect the per-message env and spawn the handler. The
+ * values travel as a value into platform_spawn, which applies them
  * where it is safe to do so for the platform (in the forked child on Unix, on
  * the parent before CreateProcess on Windows). */
-static ssize_t invoke_handler(const actor_header_t* hdr,
-                              const uint8_t*        payload,
-                              size_t                payload_len) {
+static run_status_t invoke_handler(const actor_header_t* hdr,
+                                   const uint8_t*        payload,
+                                   size_t                payload_len,
+                                   int                   attempt,
+                                   const char*           handler,
+                                   size_t*               result_len) {
     child_env_t env;
     actor_uuid_hex(hdr->id,             env.id_hex);
     actor_uuid_hex(hdr->correlation_id, env.corr_hex);
     actor_uuid_hex(hdr->causation_id,   env.caus_hex);
     snprintf(env.origin,  sizeof(env.origin),  "%.*s", 31, hdr->origin);
-    snprintf(env.attempt, sizeof(env.attempt), "%d", hdr->attempt);
+    snprintf(env.attempt, sizeof(env.attempt), "%d", attempt);
     snprintf(env.topic,   sizeof(env.topic),   "%.*s", 32, hdr->topic);
+    int64_t deadline = hdr->ttl ? hdr->emitted_at + hdr->ttl : 0;
+    snprintf(env.deadline, sizeof(env.deadline), "%lld", (long long)deadline);
 
-    return platform_spawn(payload, payload_len, g_result_buf, ACTOR_MAX_PAYLOAD, &env);
+    return platform_spawn(payload, payload_len, g_result_buf, ACTOR_MAX_PAYLOAD, &env,
+                          hdr, handler, result_len);
 }
 
 /* ── Publish ─────────────────────────────────────────────────────────────── */
 
 /* If handler output begins with a bare topic name on its own line
  * (e.g. "sql_query\n{...}"), use that topic and skip the prefix line.
- * Otherwise fall back to cfg.result_topic and use the full buffer.
+ * Otherwise fall back to the lane's result topic and use the full buffer.
  * A valid topic prefix: only [a-zA-Z0-9_] chars followed immediately by '\n'. */
-static const char* result_topic(size_t result_len, size_t* payload_off) {
+static const char* result_topic(size_t result_len, size_t* payload_off, const char* dflt) {
     *payload_off = 0;
     const char* p = (const char*)g_result_buf;
     size_t i = 0;
@@ -610,12 +1064,13 @@ static const char* result_topic(size_t result_len, size_t* payload_off) {
         }
         i++;
     }
-    return cfg.result_topic;            /* default */
+    return dflt;
 }
 
-static void publish_result(const actor_header_t* in_hdr, size_t result_len) {
+static void publish_result(const actor_header_t* in_hdr, size_t result_len,
+                           const char* dflt_topic) {
     size_t        payload_off  = 0;
-    const char*   raw_topic    = result_topic(result_len, &payload_off);
+    const char*   raw_topic    = result_topic(result_len, &payload_off, dflt_topic);
 
     /* if the handler wrote a topic prefix, null-terminate it in the buffer */
     char topic_buf[32] = {0};
@@ -654,27 +1109,53 @@ static void publish_result(const actor_header_t* in_hdr, size_t result_len) {
 
 /* ── Rejection ───────────────────────────────────────────────────────────── */
 
-static void publish_rejection(const actor_header_t* in_hdr, const char* reason) {
+/* Why a tuple was rejected; the names are the wire values of "reason". */
+typedef enum {
+    REJECT_PAYLOAD_CAP_EXCEEDED,
+    REJECT_RESULT_CAP_EXCEEDED,
+    REJECT_MAX_RETRIES_EXCEEDED,
+    REJECT_TTL_EXPIRED,
+    REJECT_TERMINATED,
+} reject_reason_t;
+
+static const char* const reject_names[] = {
+    [REJECT_PAYLOAD_CAP_EXCEEDED] = "payload_cap_exceeded",
+    [REJECT_RESULT_CAP_EXCEEDED]  = "result_cap_exceeded",
+    [REJECT_MAX_RETRIES_EXCEEDED] = "max_retries_exceeded",
+    [REJECT_TTL_EXPIRED]          = "ttl_expired",
+    [REJECT_TERMINATED]           = "terminated",
+};
+
+static void publish_rejection(const actor_header_t* in_hdr, reject_reason_t why) {
+    const char* reason = reject_names[why];
     char   id_hex[33], corr_hex[33];
     actor_uuid_hex(in_hdr->id,             id_hex);
     actor_uuid_hex(in_hdr->correlation_id, corr_hex);
 
+    /* Header strings are null-padded, not terminated, and origin is the
+       sender's to choose: bound both, and keep origin from breaking the JSON. */
+    char origin[33];
+    snprintf(origin, sizeof(origin), "%.*s", 32, in_hdr->origin);
+    for (char* c = origin; *c; c++)
+        if (*c == '"' || *c == '\\' || (unsigned char)*c < 0x20) *c = '?';
+
     char payload[512];
     size_t plen = (size_t)snprintf(payload, sizeof(payload),
         "{\"tuple_id\":\"%s\",\"correlation_id\":\"%s\","
-        "\"origin\":\"%s\",\"topic\":\"%s\",\"reason\":\"%s\"}",
+        "\"origin\":\"%s\",\"topic\":\"%.*s\",\"reason\":\"%s\"}",
         id_hex, corr_hex,
-        in_hdr->origin, in_hdr->topic, reason);
+        origin, 32, in_hdr->topic, reason);
+    if (plen >= sizeof(payload)) plen = sizeof(payload) - 1;
 
     actor_header_t hdr;
     actor_tuple_init(&hdr, "tuple_rejected", cfg.id,
                      in_hdr->correlation_id, in_hdr->id, (uint32_t)plen);
     actor_uuid_gen(hdr.id);
 
-    size_t frame_len = sizeof(actor_header_t) + plen;
-    memcpy(g_frame_buf, &hdr, sizeof(actor_header_t));
-    memcpy(g_frame_buf + sizeof(actor_header_t), payload, plen);
-    nng_send(nng_pub, g_frame_buf, frame_len, 0);
+    uint8_t frame[sizeof(actor_header_t) + sizeof(payload)];
+    memcpy(frame, &hdr, sizeof(actor_header_t));
+    memcpy(frame + sizeof(actor_header_t), payload, plen);
+    nng_send(nng_pub, frame, sizeof(actor_header_t) + plen, 0);
 
     fprintf(stderr, "[actor] rejected tuple %s reason=%s\n", id_hex, reason);
 }
@@ -682,77 +1163,108 @@ static void publish_rejection(const actor_header_t* in_hdr, const char* reason) 
 /* ── Heartbeat ───────────────────────────────────────────────────────────── */
 
 static void emit_heartbeat(void) {
-    char   payload[256];
+    char running[ACTOR_MAX_CONCURRENCY * 224];
+    char services[1024];
+    running_json(running, sizeof(running));
+    services_json(services, sizeof(services));
+
+    char   payload[sizeof(running) + sizeof(services) + 256];
     size_t plen = (size_t)snprintf(payload, sizeof(payload),
-                                   "{\"id\":\"%s\",\"inbox\":%zu,\"outbox\":%zu}",
-                                   cfg.id,
-                                   lmdb_count(dbi_inbox),
-                                   lmdb_count(dbi_outbox));
+                                   "{\"id\":\"%s\",\"inbox\":%zu,\"outbox\":%zu,"
+                                   "\"running\":%s,\"services\":%s}",
+                                   cfg.id, lmdb_count(dbi_inbox), lmdb_count(dbi_outbox),
+                                   running, services);
+    if (plen >= sizeof(payload)) plen = sizeof(payload) - 1;
 
     actor_header_t hdr;
     actor_tuple_init(&hdr, "heartbeat", cfg.id, NULL, NULL, (uint32_t)plen);
     actor_uuid_gen(hdr.id);
     hdr.ttl = (int64_t)cfg.heartbeat_ms * 3 * 1000000LL;
 
-    /* assemble header + payload into frame buffer and send */
-    size_t frame_len = sizeof(actor_header_t) + plen;
-    memcpy(g_frame_buf, &hdr, sizeof(actor_header_t));
-    memcpy(g_frame_buf + sizeof(actor_header_t), payload, plen);
-    nng_send(nng_pub, g_frame_buf, frame_len, 0);
+    uint8_t frame[sizeof(actor_header_t) + sizeof(payload)];
+    memcpy(frame, &hdr, sizeof(actor_header_t));
+    memcpy(frame + sizeof(actor_header_t), payload, plen);
+    nng_send(nng_pub, frame, sizeof(actor_header_t) + plen, 0);
+}
+
+/* Send a heartbeat if one is due. One thread only: the reaper on Unix, so a
+   busy worker never delays it; the receive loop on Windows, which has none. */
+static void heartbeat_tick(void) {
+    static int64_t last_ms;
+    if (cfg.heartbeat_ms <= 0) return;
+    int64_t now = mono_ms();
+    if (last_ms && now - last_ms < cfg.heartbeat_ms) return;
+    emit_heartbeat();
+    last_ms = now;
 }
 
 /* ── Process one tuple ───────────────────────────────────────────────────── */
 
 static void process_tuple(const actor_header_t* hdr,
                           const uint8_t*        payload,
-                          size_t                payload_len) {
+                          size_t                payload_len,
+                          tuple_source_t        source,
+                          const lane_t*         lane) {
     /* hard cap on incoming payload */
     if (payload_len > ACTOR_MAX_PAYLOAD) {
-        publish_rejection(hdr, "payload_cap_exceeded");
+        publish_rejection(hdr, REJECT_PAYLOAD_CAP_EXCEEDED);
         return;
     }
 
-    /* write inbox LMDB — assemble frame into static buffer */
+    /* publish_result reuses g_frame_buf, which may hold this very frame */
+    uint8_t id[16];
+    memcpy(id, hdr->id, sizeof(id));
+
+    /* write inbox LMDB — a replay is already in g_frame_buf */
     size_t frame_len = sizeof(actor_header_t) + payload_len;
-    memcpy(g_frame_buf, hdr, sizeof(actor_header_t));
-    memcpy(g_frame_buf + sizeof(actor_header_t), payload, payload_len);
-    lmdb_put(dbi_inbox, hdr->id, 16, g_frame_buf, frame_len);
+    if (source == TUPLE_RECEIVED) {
+        memcpy(g_frame_buf, hdr, sizeof(actor_header_t));
+        memcpy(g_frame_buf + sizeof(actor_header_t), payload, payload_len);
+    }
+    lmdb_put(dbi_inbox, id, sizeof(id), g_frame_buf, frame_len);
 
     /* exponential backoff retry loop */
     int attempt = 0;
     while (attempt <= cfg.retry_max) {
-        ssize_t result_len = invoke_handler(hdr, payload, payload_len);
+        size_t       result_len = 0;
+        run_status_t run = invoke_handler(hdr, payload, payload_len,
+                                          hdr->attempt + attempt, lane->handler, &result_len);
+        if (run == RUN_OK) {
+            /* no output means nothing to publish */
+            if (result_len > 0) publish_result(hdr, result_len, lane->result_topic);
+            break;
+        }
+        if (run == RUN_TOO_LARGE) {
+            /* no point retrying */
+            publish_rejection(hdr, REJECT_RESULT_CAP_EXCEEDED);
+            break;
+        }
+        if (run == RUN_TERMINATED) {
+            /* deliberate: neither retried nor replayed */
+            publish_rejection(hdr, REJECT_TERMINATED);
+            break;
+        }
 
-        if (result_len > 0) {
-            publish_result(hdr, (size_t)result_len);
-            break;
-        }
-        if (result_len == 0) {
-            /* handler produced no output — nothing to publish, treat as done */
-            break;
-        }
-
-        if (result_len == -2) {
-            /* result payload cap exceeded — no point retrying */
-            publish_rejection(hdr, "result_cap_exceeded");
-            break;
-        }
+        /* Stopping: leave it in the inbox for the next run to replay. */
+        if (g_stop) return;
 
         attempt++;
         if (attempt > cfg.retry_max) {
-            publish_rejection(hdr, "max_retries_exceeded");
+            publish_rejection(hdr, REJECT_MAX_RETRIES_EXCEEDED);
             break;
         }
 
-        struct timespec backoff = {
-            .tv_sec  = 0,
-            .tv_nsec = (long)(100000000LL << (attempt - 1))
-        };
+        int64_t ns = 100000000LL << (attempt < 20 ? attempt - 1 : 19);
+        struct timespec backoff = { ns / 1000000000LL, ns % 1000000000LL };
         nanosleep(&backoff, NULL);
+        if (actor_tuple_expired(hdr)) {   /* the caller gave up while we waited */
+            publish_rejection(hdr, REJECT_TTL_EXPIRED);
+            break;
+        }
         fprintf(stderr, "[actor] retry %d/%d\n", attempt, cfg.retry_max);
     }
 
-    lmdb_del(dbi_inbox, hdr->id, 16);
+    lmdb_del(dbi_inbox, id, sizeof(id));
 }
 
 /* ── Main loop ───────────────────────────────────────────────────────────── */
@@ -784,63 +1296,106 @@ static void process_tuple(const actor_header_t* hdr,
  *
  */
 
-/* One turn of the receive loop, shared by every worker. Returns 0 to keep
-   going, -1 to stop. Split out of actor_run so extra workers can run the
-   identical cycle -- the only thing that must NOT be duplicated per worker is
-   the heartbeat, which stays in actor_run. */
-static int serve_once(void) {
-    nng_msg* msg = NULL;
-    int rc = nng_recvmsg(nng_sub, &msg, 0);
-    if (rc == NNG_ETIMEDOUT) return 0;
-    if (rc != 0) {
-        if (g_stop) return -1;
-        fprintf(stderr, "[actor] recv error: %s\n", nng_strerror(rc));
-        return -1;
+/* Copy this lane's next unclaimed replay into g_frame_buf, as attempt + 1. */
+static bool replay_next(int lane, size_t* frame_len) {
+    if (atomic_load(&g_replay_left) == 0) return false;
+    for (int i = 0; i < g_replay_n; i++) {
+        if (g_replay_lane[i] != lane || atomic_exchange(&g_replay_taken[i], 1)) continue;
+        atomic_fetch_sub(&g_replay_left, 1);
+
+        MDB_txn* txn;
+        MDB_val  k = { 16, g_replay[i] }, v;
+        if (mdb_txn_begin(mdb_env, NULL, MDB_RDONLY, &txn) != 0) return false;
+        bool found = mdb_get(txn, dbi_inbox, &k, &v) == 0;
+        bool fits  = found && v.mv_size >= sizeof(actor_header_t) && v.mv_size <= ACTOR_MAX_FRAME;
+        if (fits) {
+            memcpy(g_frame_buf, v.mv_data, v.mv_size);
+            ((actor_header_t*)g_frame_buf)->attempt++;
+            *frame_len = v.mv_size;
+        }
+        mdb_txn_abort(txn);
+        if (found && !fits) {
+            fprintf(stderr, "[actor] inbox entry of %zu bytes cannot be replayed, dropping\n",
+                    v.mv_size);
+            lmdb_del(dbi_inbox, g_replay[i], 16);
+        }
+        return fits;
+    }
+    return false;
+}
+
+/* One turn of a lane's receive loop, shared by its workers; false means stop. */
+static bool serve_once(int lane) {
+    const lane_t*  l   = &g_lanes[lane];
+    nng_msg*       msg = NULL;
+    const uint8_t* frame;
+    size_t         frame_len;
+    tuple_source_t source;
+
+    if (replay_next(lane, &frame_len)) {
+        source = TUPLE_REPLAYED;
+        frame  = g_frame_buf;
+    } else {
+        int rc = nng_recvmsg(l->sub, &msg, 0);
+        if (rc == NNG_ETIMEDOUT) return true;
+        if (rc != 0) {
+            if (!g_stop) fprintf(stderr, "[actor] recv error: %s\n", nng_strerror(rc));
+            return false;
+        }
+        source    = TUPLE_RECEIVED;
+        frame     = nng_msg_body(msg);
+        frame_len = nng_msg_len(msg);
     }
 
-    void*  body     = nng_msg_body(msg);
-    size_t body_len = nng_msg_len(msg);
-
-    if (body_len < sizeof(actor_header_t)) {
-        fprintf(stderr, "[actor] short message %zu bytes, dropping\n", body_len);
+    if (frame_len < sizeof(actor_header_t)) {
+        fprintf(stderr, "[actor] short message %zu bytes, dropping\n", frame_len);
         nng_msg_free(msg);
-        return 0;
+        return true;
     }
 
-    const actor_header_t* hdr         = (const actor_header_t*)body;
-    const uint8_t*        payload     = (const uint8_t*)body + sizeof(actor_header_t);
-    size_t                payload_len = body_len - sizeof(actor_header_t);
+    const actor_header_t* hdr         = (const actor_header_t*)frame;
+    const uint8_t*        payload     = frame + sizeof(actor_header_t);
+    size_t                payload_len = frame_len - sizeof(actor_header_t);
 
     /* TTL check — before process_tuple, so an abandoned request costs the
        check and nothing else. This is what keeps a backed-up queue from
        feeding on itself: work whose caller has already given up is dropped
        rather than forked. */
     if (actor_tuple_expired(hdr)) {
-        publish_rejection(hdr, "ttl_expired");
-        nng_msg_free(msg);
-        return 0;
+        publish_rejection(hdr, REJECT_TTL_EXPIRED);
+        if (source == TUPLE_REPLAYED) lmdb_del(dbi_inbox, hdr->id, 16);
+    } else {
+        process_tuple(hdr, payload, payload_len, source, l);
     }
-
-    process_tuple(hdr, payload, payload_len);
-    nng_msg_free(msg);
-    return 0;
+    if (msg) nng_msg_free(msg);
+    return true;
 }
 
 #ifndef _WIN32
-/* Extra worker. nng sockets are safe to use from several threads, so each
-   worker simply blocks in its own recv; the SUB socket hands each message to
-   exactly one of them. */
+/* Extra worker, bound to one lane. nng sockets are safe to use from several
+   threads, so each worker simply blocks in its own recv; the lane's SUB socket
+   hands each message to exactly one of them. */
 static void* worker_main(void* arg) {
-    (void)arg;
+    int lane = (int)(intptr_t)arg;
     while (!g_stop) {
-        if (serve_once() < 0) break;
+        if (!serve_once(lane)) break;
     }
     return NULL;
 }
 #endif
 
 int actor_run(void) {
-    if (cfg_load() < 0) return -1;
+    if (cfg_load() < 0 || lanes_load() < 0) return -1;
+#ifdef _WIN32
+    if (getenv("ACTOR_INIT") || services_requested() ||
+        getenv("PROXY_SUB_BIND") || getenv("PROXY_PUB_BIND")) {
+        fprintf(stderr, "[actor] ACTOR_INIT, ACTOR_SERVICE_* and hosting the bus "
+                        "are not available on Windows\n");
+        return -1;
+    }
+#else
+    if (services_load() < 0) return -1;
+#endif
 
 #ifndef _WIN32
     /* Confinement goes here and nowhere else: after the config read, before
@@ -851,6 +1406,7 @@ int actor_run(void) {
         fprintf(stderr, "[actor] FATAL: isolation requested but not applied\n");
         return -1;
     }
+    if (run_init() < 0 || bus_host() < 0) return -1;
 #endif
 
     signal(SIGTERM, on_signal);
@@ -861,13 +1417,18 @@ int actor_run(void) {
 
     fprintf(stderr, "[actor] id=%s topic(s)=%s handler=%s max_payload=%d concurrency=%d\n",
             cfg.id, cfg.topic, cfg.handler, ACTOR_MAX_PAYLOAD, cfg.concurrency);
-
-    int64_t last_hb = 0;
+    for (int i = 0; g_nlanes > 1 && i < g_nlanes; i++)
+        fprintf(stderr, "[actor] lane %d: topic(s)=%s handler=%s result=%s concurrency=%d\n",
+                i, g_lanes[i].topics, g_lanes[i].handler, g_lanes[i].result_topic,
+                g_lanes[i].concurrency);
+    if (g_replay_n) fprintf(stderr, "[actor] replaying %d tuple(s) from the inbox\n", g_replay_n);
 
 #ifndef _WIN32
     /* The reaper runs even at concurrency 1: it is what collects the orphaned
        grandchildren this process inherits as PID 1, a job the old between-
        messages sweep used to do. */
+    for (int i = 0; i < g_nservices; i++) service_spawn(&g_services[i]);
+
     pthread_t reaper;
     int reaper_started = (pthread_create(&reaper, NULL, reaper_main, NULL) == 0);
     if (!reaper_started) {
@@ -875,43 +1436,43 @@ int actor_run(void) {
         return -1;
     }
 
+    /* The main thread is lane 0's first worker. */
     pthread_t workers[ACTOR_MAX_CONCURRENCY];
     int nworkers = 0;
-    for (int i = 1; i < cfg.concurrency; i++) {
-        if (pthread_create(&workers[nworkers], NULL, worker_main, NULL) != 0) {
-            fprintf(stderr, "[actor] could not start worker %d, continuing with %d\n",
-                    i, nworkers + 1);
-            break;
+    for (int li = 0; li < g_nlanes; li++) {
+        for (int k = (li == 0); k < g_lanes[li].concurrency; k++) {
+            if (pthread_create(&workers[nworkers], NULL, worker_main, (void*)(intptr_t)li) != 0) {
+                fprintf(stderr, "[actor] could not start a worker for lane %d\n", li);
+                break;
+            }
+            nworkers++;
         }
-        nworkers++;
     }
 #endif
 
     while (!g_stop) {
-        /* heartbeat — this thread only, so the interval does not multiply by
-           the worker count */
-        if (cfg.heartbeat_ms > 0) {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            int64_t now_ms = ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
-            if (now_ms - last_hb >= cfg.heartbeat_ms) {
-                emit_heartbeat();
-                last_hb = now_ms;
-            }
-        }
-
-        /* receive with 100ms timeout — unblocks for heartbeat check */
-        if (serve_once() < 0) break;
+#ifdef _WIN32
+        heartbeat_tick();
+#endif
+        if (!serve_once(0)) break;
     }
 
     fprintf(stderr, "[actor] shutting down\n");
 #ifndef _WIN32
     g_stop = 1;
     for (int i = 0; i < nworkers; i++) pthread_join(workers[i], NULL);
+    atomic_store(&g_reaper_stop, 1);
     pthread_join(reaper, NULL);
 #endif
     nng_close(nng_pub);
-    nng_close(nng_sub);
+    for (int i = 0; i < g_nlanes; i++) nng_close(g_lanes[i].sub);
+#ifndef _WIN32
+    nng_close(nng_ctl);
+    bus_unhost();
+#endif
     mdb_env_close(mdb_env);
+#ifndef _WIN32
+    if (atomic_load(&g_services_failed)) return -1;
+#endif
     return 0;
 }

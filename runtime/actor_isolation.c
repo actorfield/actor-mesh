@@ -1152,28 +1152,48 @@ static int apply_seccomp(void) {
 
 /* ── Entry point ─────────────────────────────────────────────────────────── */
 
-/* True if this process appears to have more than one thread.
- *
- * /proc/self/status carries a labelled "Threads:" line, which avoids parsing
- * /proc/self/stat positionally past a comm field that may itself contain
- * spaces and parentheses. If /proc is not mounted we cannot tell, and this
- * returns 0: the check guards against a future reordering of actor_run, not
- * against an attacker, so being unable to perform it must not block an actor
- * that is in fact single-threaded. */
-static int looks_multithreaded(void) {
+/* The value of a labelled /proc/self/status line, or dflt if there is none.
+ * Labelled lines avoid parsing /proc/self/stat positionally past a comm field
+ * that may itself contain spaces and parentheses. */
+static unsigned long long status_value(const char* label, int base,
+                                       unsigned long long dflt) {
     FILE* f = fopen("/proc/self/status", "r");
-    if (!f) return 0;
-
-    char line[256];
-    int threads = 0;
+    if (!f) return dflt;
+    char   line[256];
+    size_t n = strlen(label);
+    unsigned long long v = dflt;
     while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, "Threads:", 8) == 0) {
-            threads = atoi(line + 8);
-            break;
-        }
+        if (strncmp(line, label, n) == 0) { v = strtoull(line + n, NULL, base); break; }
     }
     fclose(f);
-    return threads > 1;
+    return v;
+}
+
+/* True if this process appears to have more than one thread. If /proc is not
+ * mounted we cannot tell, and this returns 0: the check guards against a
+ * future reordering of actor_run, not against an attacker, so being unable to
+ * perform it must not block an actor that is in fact single-threaded. */
+static int looks_multithreaded(void) {
+    return status_value("Threads:", 10, 0) > 1;
+}
+
+enum { CAP_SYS_ADMIN_BIT = 21, CAP_SYS_RESOURCE_BIT = 24 };
+
+/* True if RLIMIT_NPROC would not apply to this process. The kernel exempts
+ * real uid 0 and holders of CAP_SYS_ADMIN or CAP_SYS_RESOURCE, judged in the
+ * initial user namespace -- root inside a rootless container is still bound.
+ * Without /proc, assume the initial namespace: refusing is the safe error. */
+static int nproc_exempt(void) {
+    FILE* f = fopen("/proc/self/uid_map", "r");
+    if (f) {
+        unsigned in = 0, out = 0, count = 0;
+        int got = fscanf(f, "%u %u %u", &in, &out, &count);
+        fclose(f);
+        if (got == 3 && !(in == 0 && out == 0 && count == 4294967295u)) return 0;
+    }
+    unsigned long long eff = status_value("CapEff:", 16, 0);
+    return getuid() == 0 ||
+           ((eff >> CAP_SYS_ADMIN_BIT) & 1) || ((eff >> CAP_SYS_RESOURCE_BIT) & 1);
 }
 
 int actor_isolation_apply(void) {
@@ -1220,6 +1240,14 @@ int actor_isolation_apply(void) {
     if (apply_rlimit("ACTOR_RLIMIT_NPROC",  RLIMIT_NPROC,  "RLIMIT_NPROC")  < 0) return -1;
 
     if (drop_privilege() < 0) return -1;
+
+    /* Still exempt after the drop: the limit would do nothing (see above). */
+    if (getenv("ACTOR_RLIMIT_NPROC") && nproc_exempt()) {
+        fprintf(stderr, "[actor] isolation: ACTOR_RLIMIT_NPROC does not apply to uid %u or "
+                        "to CAP_SYS_ADMIN/CAP_SYS_RESOURCE; set ACTOR_UID to an ordinary uid\n",
+                (unsigned)getuid());
+        return -1;
+    }
 
     /* cgroup before Landlock: joining needs to open a path under
        /sys/fs/cgroup, which an operator has no reason to put in the ruleset. */

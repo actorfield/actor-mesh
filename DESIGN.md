@@ -5,7 +5,8 @@
 A minimal distributed actor mesh built on Unix primitives.
 No frameworks. No sidecars. No brokers. Just processes.
 
-The runtime is ~506 lines of C. The proxy is ~57 lines of C.
+The runtime is ~1,500 lines of C, plus ~1,300 for optional isolation.
+The proxy is ~130 lines, most of it the forwarder it shares with the actor.
 A handler is any process that speaks stdio.
 
 ---
@@ -110,7 +111,9 @@ Header env vars available to every handler:
 | `ACTOR_CORRELATION_ID` | hex correlation id (same across chain) |
 | `ACTOR_CAUSATION_ID` | hex id of direct parent tuple |
 | `ACTOR_TUPLE_ORIGIN` | origin actor id |
-| `ACTOR_ATTEMPT` | retry count |
+| `ACTOR_ATTEMPT` | retries and replays so far, 0 = first run |
+| `ACTOR_TUPLE_TOPIC` | topic that delivered the tuple |
+| `ACTOR_TUPLE_DEADLINE` | `emitted_at + ttl` in unix ns; `0` = no deadline |
 
 ---
 
@@ -123,6 +126,23 @@ ACTOR_TOPIC=user_message,sql_result ./actor
 ```
 
 One actor instance receives tuples on all listed topics.
+
+### Lanes
+
+A topic can have its own handler, result topic or concurrency:
+
+```sh
+ACTOR_TOPIC=sql_query,cancel
+ACTOR_HANDLER=./handlers/sqlite-tool   ACTOR_CONCURRENCY=4
+ACTOR_HANDLER_cancel=./handlers/cancel ACTOR_CONCURRENCY_cancel=1
+```
+
+A topic with a setting of its own becomes a lane: its own socket and its own
+workers, so it never waits behind another topic's work. Topics without one
+share the default lane, which is the whole actor when nothing is set. The
+lanes together may use at most 32 workers; asking for more fails startup.
+Per-topic settings need identifier topics (`[A-Za-z0-9_]`), the same rule as
+a handler's topic override.
 
 ---
 
@@ -155,13 +175,15 @@ int main(void) {
 ## Runtime Lifecycle
 
 ```
-1. Read config from environment
+1. Read config from environment; build lanes, collect services
 2. Apply isolation if configured — before sockets, LMDB, or any thread
-3. Connect NNG pub0 + sub0 to proxy
-4. Open LMDB
-5. Enter poll loop:
-   a. Emit heartbeat every ACTOR_HEARTBEAT_MS
-   b. NNG recvmsg (100ms timeout)
+3. Run ACTOR_INIT; open the built-in bus if PROXY_*_BIND is set
+4. Connect NNG pub0, one sub0 per lane, and the _term control socket
+5. Open LMDB and collect the inbox to replay; start services
+6. Start the reaper — reaps, restarts services, acts on _term, sends the
+   heartbeat — and each lane's workers, which loop:
+   a. Take this lane's next replay, if any
+   b. Otherwise NNG recvmsg (100ms timeout)
    c. Receive header + payload as single buffer
    d. Cast to actor_header_t (zero copy)
    e. Check TTL — drop if expired
@@ -173,7 +195,8 @@ int main(void) {
    k. Write result frame to LMDB outbox
    l. Publish result to NNG bus
    m. Clear LMDB inbox + outbox
-6. On SIGTERM — drain and exit
+7. On SIGTERM — stop receiving, let running handlers finish, exit.
+   One that fails is not retried; it stays in the inbox for the next run.
 ```
 
 ---
@@ -188,8 +211,10 @@ outbox/  {uuidv7} → raw frame    written before publish, cleared after publish
 state/   {key}    → bytes        handler-managed state (e.g. conversation history)
 ```
 
-On restart — pending inbox tuples are reprocessed.
-Pending outbox tuples are republished.
+On restart, every tuple left in the inbox is processed again before new
+messages, with `ACTOR_ATTEMPT` one higher so the handler can tell. The
+inbox entry is cleared only after the result is published, so this also
+covers a crash mid-publish: delivery is at-least-once.
 No central coordinator needed.
 
 Handlers can use the same LMDB (via `ACTOR_LMDB_PATH`) to persist state
@@ -283,7 +308,9 @@ worst available reading of a typo.
   system-wide** — not the actor's descendants. Give an actor its own uid and
   size the limit against `ps -L -u <uid> | wc -l`, or a value that looks
   generous can already be below current usage and the actor dies on its first
-  `pthread_create`.
+  `pthread_create`. Root in the initial user namespace, and any process holding
+  `CAP_SYS_ADMIN` or `CAP_SYS_RESOURCE`, is exempt from it, so setting it there
+  without an `ACTOR_UID` to drop to fails startup.
 - **Namespaces need privilege.** Unprivileged `unshare(CLONE_NEWPID)` is EPERM
   on a stock host; the runtime retries behind a user namespace, which works
   where unprivileged user namespaces are enabled. `ACTOR_TUPLE_USERNS=0` opts
@@ -369,16 +396,25 @@ ACTOR_SECCOMP=permissive_mount \
 
 ## Heartbeat
 
-Every actor emits a heartbeat tuple periodically:
+Every actor emits a heartbeat tuple periodically, listing what it is running:
 
 ```json
-{"id": "sqlite-tool-1", "inbox": 0, "outbox": 0}
+{"id": "sqlite-tool-1", "inbox": 1, "outbox": 0,
+ "running": [{"tuple": "0190…", "correlation": "0190…", "topic": "sql_query",
+              "pid": 4312, "age_ms": 850, "terminating": false}],
+ "services": [{"name": "web", "pid": 4100, "restarts": 0}]}
 ```
 
 Topic: `heartbeat`
 TTL: 3 × heartbeat interval
 
-Any actor subscribed to `heartbeat` can observe the mesh state.
+Any actor subscribed to `heartbeat` can observe the mesh state. `running` is
+the actor's process table: `pid` leads the handler's process group, and
+`correlation` is what a `_term` names to stop it. It is empty on Windows.
+
+The thread that reaps handlers sends it, so a long-running handler never
+silences it — at `ACTOR_CONCURRENCY=1` the only worker is busy for exactly as
+long as the heartbeat matters most.
 
 ---
 
@@ -394,6 +430,75 @@ max retry  →  drop tuple, log error
 
 Controlled by `ACTOR_RETRY_MAX` (default 3).
 Payload cap exceeded → drop immediately, no retry.
+
+TTL is a deadline for starting work, not for finishing it. It is checked
+before the handler runs and again before each retry, so a tuple whose caller
+has given up is rejected as `ttl_expired` rather than run again. A running
+handler is not stopped at it; it can read the deadline from
+`ACTOR_TUPLE_DEADLINE` and budget its own work.
+
+---
+
+## Remote control
+
+A message starts a handler; `_term` is the message that stops one.
+
+Every actor subscribes to `_term`. The header names the target, so the
+runtime still never reads a payload:
+
+- `correlation_id` — the chain to stop. Required; all-zero is ignored.
+- `causation_id` — if non-zero, only the tuple with that id.
+
+Each handler leads its own process group. On `_term` the actor sends
+SIGTERM to the group of every matching handler, and SIGKILL to whatever is
+left after `ACTOR_TERM_GRACE_MS`. The SIGKILL is what guarantees the stop:
+the init of a PID namespace ignores SIGTERM from outside unless it handles
+it. The tuple is reported as `tuple_rejected` with reason `terminated`, and
+is neither retried nor replayed.
+
+`_term` is read by the thread that reaps handlers, not by the workers, so it
+arrives even when every worker is busy. It stops what is running; a tuple
+still queued or waiting between retries is not affected. Anyone who can
+publish to the bus can send one — the same trust as any other publish.
+
+---
+
+## Services
+
+A handler lives for one tuple. A service lives as long as the actor:
+
+```sh
+ACTOR_INIT='./migrate'                  # once, to completion, before anything is served
+ACTOR_SERVICE_web='./web --port 8080'   # started with the actor, restarted when it exits
+```
+
+`ACTOR_INIT` runs after isolation is applied and before the bus is joined; a
+non-zero exit stops the actor, like any other failed startup step. Each
+`ACTOR_SERVICE_<name>` starts before the first tuple is served, in its own
+process group, and the thread that reaps handlers restarts it when it exits.
+After five restarts within a minute the actor gives up and exits non-zero,
+so whatever supervises the actor backs off instead of watching it spin. At
+shutdown, services get SIGTERM once the handlers have drained, and SIGKILL
+after `ACTOR_TERM_GRACE_MS`. The heartbeat lists them under `services`.
+
+Both inherit the actor's isolation. Neither is available on Windows.
+
+---
+
+## Built-in bus
+
+`mesh-proxy` is a forwarder with two sockets. An actor given the same two
+variables runs that forwarder itself, on a thread of its own:
+
+```sh
+PROXY_SUB_BIND=tcp://127.0.0.1:5557 PROXY_PUB_BIND=tcp://127.0.0.1:5556 \
+ACTOR_BUS_PUB=tcp://127.0.0.1:5557  ACTOR_BUS_SUB=tcp://127.0.0.1:5556 ... ./actor
+```
+
+The bus listens before the actor dials it and before any service starts, so
+nothing waits on start-up order, and it closes last. Everything else on the
+mesh dials it exactly as it would dial `mesh-proxy`. It sends no heartbeat of
+its own; the actor's covers it. Not available on Windows.
 
 ---
 
@@ -412,6 +517,10 @@ Payload cap exceeded → drop immediately, no retry.
 | `ACTOR_HEARTBEAT_MS` | ☐ | 5000 | Heartbeat interval ms |
 | `ACTOR_RETRY_MAX` | ☐ | 3 | Max handler retries |
 | `ACTOR_CONCURRENCY` | ☐ | 1 | Messages in flight at once (max 32) |
+| `ACTOR_TERM_GRACE_MS` | ☐ | 5000 | SIGTERM to SIGKILL grace for `_term` (Unix) |
+| `ACTOR_HANDLER_<topic>`, `ACTOR_RESULT_TOPIC_<topic>`, `ACTOR_CONCURRENCY_<topic>` | ☐ | — | Give a topic its own lane (see [Lanes](#lanes)) |
+| `ACTOR_INIT` | ☐ | — | Command run once before serving (see [Services](#services)) |
+| `ACTOR_SERVICE_<name>` | ☐ | — | Command kept running for the actor's lifetime (Unix) |
 
 Isolation (Linux, all optional — see [Isolation](#isolation)):
 
@@ -435,6 +544,8 @@ Proxy:
 | `PROXY_SUB_BIND` | `tcp://*:5557` | Actors publish here |
 | `PROXY_PUB_BIND` | `tcp://*:5556` | Actors subscribe here |
 
+Set both on an actor and it hosts the bus itself; see [Built-in bus](#built-in-bus).
+
 ---
 
 ## File Layout
@@ -445,12 +556,13 @@ actor-mesh/
 ├── DESIGN.md
 ├── runtime/
 │   ├── actor.h                 public API — actor_run()
-│   ├── actor.c                 runtime (~506 lines, zero malloc)
+│   ├── actor.c                 runtime (~1,500 lines, no heap per tuple)
 │   ├── actor_tuple.h           256-byte header + helpers
 │   ├── actor_uuid.h            uuidv7 single-header, no deps
+│   ├── bus.c, bus.h            pub/sub forwarder, shared with the proxy
 │   └── main.c                  12-line entrypoint
 ├── proxy/
-│   └── proxy.c                 NNG pub/sub fanout (~57 lines)
+│   └── proxy.c                 heartbeat around the shared forwarder
 ├── examples/
 │   └── employee-mesh/          HR Q&A demo (ReAct loop over SQLite)
 │       ├── Makefile            build + run + query

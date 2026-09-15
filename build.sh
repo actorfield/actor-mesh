@@ -129,12 +129,16 @@ case "$TARGET" in
     *musl*) LDFLAGS="$LDFLAGS -static" ;;
 esac
 
+# actor.c calls the isolation unit on every target but Windows
+ISOLATION="$ROOT/runtime/actor_isolation.c"
+case "$TARGET" in *windows*) ISOLATION="" ;; esac
+
 $ZIG cc $CFLAGS $LDFLAGS $INCLUDES \
-    "$ROOT/runtime/main.c" "$ROOT/runtime/actor.c" \
+    "$ROOT/runtime/main.c" "$ROOT/runtime/actor.c" "$ROOT/runtime/bus.c" $ISOLATION \
     $LIBS -o "$BUILD_DIR/actor$EXE"
 
 $ZIG cc $CFLAGS $LDFLAGS $INCLUDES \
-    "$ROOT/proxy/proxy.c" \
+    "$ROOT/proxy/proxy.c" "$ROOT/runtime/bus.c" \
     $LIBS -o "$BUILD_DIR/mesh-proxy$EXE"
 
 echo ""

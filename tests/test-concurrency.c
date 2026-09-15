@@ -53,13 +53,17 @@ static int64_t now_ms(void) {
 }
 
 /* Build and publish a frame. ttl_ns 0 = no expiry. */
-static void sendm(const char *topic, const char *payload, int64_t ttl_ns, int64_t emitted_override) {
+/* chain, when non-zero, fills the tuple id and correlation id with that byte. */
+static void sendm_as(const char *origin, const char *topic, const char *payload,
+                     int64_t ttl_ns, int64_t emitted_override, uint8_t chain) {
     nng_socket s; nng_pub0_open(&s); nng_dial(s, PP, NULL, 0); ms(60);
     size_t pl = strlen(payload);
     uint8_t f[1024] = {0};
     size_t tl = strlen(topic); if (tl > 31) tl = 31;
     memcpy(f, topic, tl);
-    memcpy(f + 80, "test", 4);                       /* origin */
+    memset(f + 32, chain, 16);                       /* id          */
+    memset(f + 48, chain, 16);                       /* correlation */
+    memcpy(f + 80, origin, strnlen(origin, 32));     /* origin */
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
     int64_t ns = emitted_override ? emitted_override
                                   : ts.tv_sec * 1000000000LL + ts.tv_nsec;
@@ -70,6 +74,10 @@ static void sendm(const char *topic, const char *payload, int64_t ttl_ns, int64_
     memcpy(f + 256, payload, pl);
     nng_send(s, f, 256 + pl, 0);
     nng_close(s);
+}
+
+static void sendm(const char *topic, const char *payload, int64_t ttl_ns, int64_t emitted_override) {
+    sendm_as("test", topic, payload, ttl_ns, emitted_override, 0);
 }
 
 /* Subscribers must exist BEFORE anything is published — this is pub/sub, so a
@@ -118,19 +126,38 @@ static pid_t start_proxy(void) {
  * runtime as a TOPIC OVERRIDE (see result_topic), so `echo ok` publishes to
  * topic "ok" and never to ACTOR_RESULT_TOPIC. Handlers here emit ":ok" so the
  * leading ':' disables that and results land where the test subscribes. */
-static pid_t start_actor(const char *handler, const char *conc, const char *retry, const char *dir) {
+/* spawn_actor keeps whatever LMDB `dir` already holds; start_actor empties it. */
+static pid_t spawn_actor(const char *handler, const char *conc, const char *retry, const char *dir) {
     static char h[512], c[64], r[64], d[256];
     snprintf(h, sizeof h, "ACTOR_HANDLER=%s", handler);
     snprintf(c, sizeof c, "ACTOR_CONCURRENCY=%s", conc);
     snprintf(r, sizeof r, "ACTOR_RETRY_MAX=%s", retry);
     snprintf(d, sizeof d, "ACTOR_LMDB_PATH=%s", dir);
-    char cmd[512]; snprintf(cmd, sizeof cmd, "rm -rf %s; mkdir -p %s", dir, dir);
-    system(cmd);
     char *a[] = { "./bin/actor", NULL };
     char *e[] = { "ACTOR_BUS_SUB=" SP, "ACTOR_BUS_PUB=" PP, "ACTOR_HEARTBEAT_MS=0",
                   "ACTOR_ID=tc", "ACTOR_TOPIC=work", "ACTOR_RESULT_TOPIC=done",
-                  h, c, r, d, NULL };
+                  "ACTOR_TERM_GRACE_MS=500", h, c, r, d, NULL };
     pid_t p = sp_(a, e); ms(700); return p;
+}
+
+static pid_t start_actor(const char *handler, const char *conc, const char *retry, const char *dir) {
+    char cmd[512]; snprintf(cmd, sizeof cmd, "rm -rf %s; mkdir -p %s", dir, dir);
+    system(cmd);
+    return spawn_actor(handler, conc, retry, dir);
+}
+
+static int wait_exit(pid_t p, int budget) {
+    for (int64_t end = now_ms() + budget; now_ms() < end; ms(50))
+        if (waitpid(p, NULL, WNOHANG) == p) return 1;
+    return 0;
+}
+
+/* Read a small log, newlines turned into spaces for one-line output. */
+static void slurp(const char *path, char *buf, size_t cap) {
+    buf[0] = 0;
+    FILE *f = fopen(path, "r");
+    if (f) { buf[fread(buf, 1, cap - 1, f)] = 0; fclose(f); }
+    for (char *c = buf; *c; c++) if (*c == '\n') *c = ' ';
 }
 
 static void stop(pid_t proxy, pid_t actor) {
@@ -309,6 +336,458 @@ static void t_live_ttl_still_runs(void) {
     CHECK(n == 1, "a live tuple was dropped");
 }
 
+/* ── 5. Retries ───────────────────────────────────────────────────────────── */
+
+static void t_retry_attempts_and_backoff(void) {
+    TEST("retries count up in ACTOR_ATTEMPT and keep backing off past 1s");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -f /tmp/tc_retry_log");
+    pid_t ap = start_actor("sh -c 'echo $ACTOR_ATTEMPT >> /tmp/tc_retry_log; exit 1'",
+                           "1", "5", "/tmp/tc_retry");
+    nng_socket rej = sub_open("tuple_rejected");
+    int64_t t0 = now_ms();
+    sendm("work", "x", 0, 0);
+    int rejected = drain_n(rej, 8000, 1, NULL, 0);
+    int64_t elapsed = now_ms() - t0;
+    nng_close(rej);
+    stop(pp, ap);
+    char log[64]; slurp("/tmp/tc_retry_log", log, sizeof log);
+    printf("  rejected=%d elapsed=%lldms attempts=[%s]\n", rejected, (long long)elapsed, log);
+    CHECK(rejected == 1, "exhausted retries were not rejected");
+    CHECK(strcmp(log, "0 1 2 3 4 5 ") == 0, "ACTOR_ATTEMPT did not count the retries");
+    /* 100+200+400+800+1600ms: the fifth backoff is the one that used to vanish */
+    CHECK(elapsed >= 3100, "backoff was skipped");
+}
+
+/* ── 6. Durability ────────────────────────────────────────────────────────── */
+
+static void t_replay_after_crash(void) {
+    TEST("a tuple in flight when the actor dies is replayed on restart as attempt 1");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -f /tmp/tc_rp_log");
+    const char *h = "sh -c 'echo $ACTOR_ATTEMPT >> /tmp/tc_rp_log; sleep 1; echo :ok'";
+    pid_t ap = start_actor(h, "1", "0", "/tmp/tc_rp");
+    sendm("work", "x", 0, 0);
+    ms(400);
+    kill(ap, SIGKILL); waitpid(ap, NULL, 0);
+    nng_socket done = sub_open("done");
+    ap = spawn_actor(h, "1", "0", "/tmp/tc_rp");
+    int n = drain_n(done, 4000, 1, NULL, 0);
+    nng_close(done);
+    stop(pp, ap);
+    char log[64]; slurp("/tmp/tc_rp_log", log, sizeof log);
+    printf("  results=%d attempts=[%s]\n", n, log);
+    CHECK(n == 1, "the interrupted tuple was not replayed");
+    CHECK(strcmp(log, "0 1 ") == 0, "the replay did not arrive as attempt 1");
+}
+
+static void t_stop_leaves_unfinished(void) {
+    TEST("SIGTERM lets a handler finish, does not retry it, and the next run does");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -f /tmp/tc_st_log");
+    pid_t ap = start_actor("sh -c 'echo $ACTOR_ATTEMPT >> /tmp/tc_st_log; sleep 1; exit 1'",
+                           "1", "3", "/tmp/tc_st");
+    nng_socket rej = sub_open("tuple_rejected");
+    sendm("work", "x", 0, 0);
+    ms(400);
+    kill(ap, SIGTERM);
+    int exited = wait_exit(ap, 5000);
+    int rejected = drain(rej, 300, NULL, 0);
+    nng_close(rej);
+    nng_socket done = sub_open("done");
+    ap = spawn_actor("sh -c 'echo $ACTOR_ATTEMPT >> /tmp/tc_st_log; echo :ok'",
+                     "1", "3", "/tmp/tc_st");
+    int n = drain_n(done, 3000, 1, NULL, 0);
+    nng_close(done);
+    stop(pp, ap);
+    char log[64]; slurp("/tmp/tc_st_log", log, sizeof log);
+    printf("  exited=%d rejected=%d results=%d attempts=[%s]\n", exited, rejected, n, log);
+    CHECK(exited, "the actor did not exit once its handler finished");
+    CHECK(rejected == 0, "a failure during shutdown was retried into a rejection");
+    CHECK(n == 1 && strcmp(log, "0 1 ") == 0, "the unfinished tuple was not replayed");
+}
+
+/* ── 7. Rejections ────────────────────────────────────────────────────────── */
+
+static void t_rejection_bounds_origin(void) {
+    TEST("a rejection quotes a full-width origin within its field, as valid JSON");
+    cleanup();
+    pid_t pp = start_proxy();
+    pid_t ap = start_actor("sh -c 'echo :ok'", "1", "0", "/tmp/tc_rj");
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    int64_t old = (ts.tv_sec - 10) * 1000000000LL + ts.tv_nsec;
+    nng_socket rej = sub_open("tuple_rejected");
+    /* 32 bytes, no terminator, one quote; expired so it is rejected on arrival */
+    sendm_as("ab\"cdefghijklmnopqrstuvwxyz01234", "work", "x", 1000000000LL, old, 0);
+    char body[512] = {0};
+    drain_n(rej, 3000, 1, body, sizeof body);
+    nng_close(rej);
+    stop(pp, ap);
+    printf("  %.200s\n", body);
+    CHECK(strstr(body, "\"origin\":\"ab?cdefghijklmnopqrstuvwxyz01234\",\"topic\":\"work\"") != NULL,
+          "origin ran past its field or broke the JSON");
+}
+
+/* ── 8. Remote terminate ─────────────────────────────────────────────────── */
+
+/* How many processes have exactly these args. */
+static int procs_named(const char *args) {
+    char cmd[256];
+    snprintf(cmd, sizeof cmd, "ps -eo args | grep -cx '%s'", args);
+    FILE *f = popen(cmd, "r");
+    int n = -1;
+    if (f) { if (fscanf(f, "%d", &n) != 1) n = -1; pclose(f); }
+    return n;
+}
+
+static void t_term_stops_the_group(void) {
+    TEST("_term stops a handler and all it started, with every worker busy");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -f /tmp/tc_term_log");
+    pid_t ap = start_actor("sh -c 'echo $ACTOR_ATTEMPT >> /tmp/tc_term_log; sleep 31 & sleep 31'",
+                           "1", "3", "/tmp/tc_term");
+    nng_socket rej  = sub_open("tuple_rejected");
+    nng_socket done = sub_open("done");
+    sendm_as("test", "work", "x", 0, 0, 0x11);
+    ms(500);
+    int before = procs_named("sleep 31");
+    int64_t t0 = now_ms();
+    sendm_as("test", "_term", "", 0, 0, 0x11);
+    char reason[512] = {0};
+    int rejected = drain_n(rej, 3000, 1, reason, sizeof reason);
+    int64_t elapsed = now_ms() - t0;
+    ms(300);
+    int after = procs_named("sleep 31");
+    int results = drain(done, 300, NULL, 0);
+    nng_close(rej); nng_close(done);
+    stop(pp, ap);
+    system("pkill -9 -x sleep 2>/dev/null");
+    char log[64]; slurp("/tmp/tc_term_log", log, sizeof log);
+    printf("  sleeps %d -> %d, rejected=%d in %lldms, results=%d, attempts=[%s]\n",
+           before, after, rejected, (long long)elapsed, results, log);
+    CHECK(before == 2 && after == 0, "the handler's process group outlived _term");
+    CHECK(rejected == 1 && strstr(reason, "\"reason\":\"terminated\"") != NULL,
+          "not reported as terminated");
+    CHECK(elapsed < 500, "SIGTERM alone should have been enough");
+    CHECK(results == 0 && strcmp(log, "0 ") == 0, "a terminated tuple was retried or published");
+}
+
+static void t_term_escalates_to_kill(void) {
+    TEST("a handler that ignores SIGTERM is killed after ACTOR_TERM_GRACE_MS");
+    cleanup();
+    pid_t pp = start_proxy();
+    pid_t ap = start_actor("sh -c 'trap \"\" TERM; sleep 32'", "1", "0", "/tmp/tc_kill");
+    nng_socket rej = sub_open("tuple_rejected");
+    sendm_as("test", "work", "x", 0, 0, 0x12);
+    ms(500);
+    int64_t t0 = now_ms();
+    sendm_as("test", "_term", "", 0, 0, 0x12);
+    char reason[512] = {0};
+    int rejected = drain_n(rej, 4000, 1, reason, sizeof reason);
+    int64_t elapsed = now_ms() - t0;
+    ms(200);
+    int left = procs_named("sleep 32");
+    nng_close(rej);
+    stop(pp, ap);
+    system("pkill -9 -x sleep 2>/dev/null");
+    printf("  rejected=%d in %lldms, left=%d\n", rejected, (long long)elapsed, left);
+    CHECK(rejected == 1 && strstr(reason, "terminated") != NULL, "not reported as terminated");
+    CHECK(elapsed >= 500 && elapsed < 2000, "SIGKILL did not follow the 500ms grace");
+    CHECK(left == 0, "a process survived SIGKILL");
+}
+
+static void t_term_names_its_target(void) {
+    TEST("_term for another chain, or for no chain, leaves a running tuple alone");
+    cleanup();
+    pid_t pp = start_proxy();
+    pid_t ap = start_actor("sh -c 'sleep 1; echo :ok'", "2", "0", "/tmp/tc_other");
+    nng_socket rej  = sub_open("tuple_rejected");
+    nng_socket done = sub_open("done");
+    sendm("work", "x", 0, 0);                    /* correlation all zero */
+    ms(300);
+    sendm_as("test", "_term", "", 0, 0, 0x22);   /* a chain that is not running */
+    sendm_as("test", "_term", "", 0, 0, 0x00);   /* names no chain: ignored */
+    int results  = drain_n(done, 3000, 1, NULL, 0);
+    int rejected = drain(rej, 300, NULL, 0);
+    nng_close(rej); nng_close(done);
+    stop(pp, ap);
+    printf("  results=%d rejected=%d\n", results, rejected);
+    CHECK(results == 1 && rejected == 0, "a _term reached a tuple it did not name");
+}
+
+/* ── 9. Status ──────────────────────────────────────────────────────────── */
+
+/* The last payload containing `must` seen on s within budget ms. */
+static void last_payload(nng_socket s, int budget, const char *must, char *buf, size_t cap) {
+    buf[0] = 0;
+    for (int64_t end = now_ms() + budget; now_ms() < end; ) {
+        nng_msg *m = NULL;
+        if (nng_recvmsg(s, &m, 0) != 0) continue;
+        char tmp[8192];
+        size_t l = nng_msg_len(m) > 256 ? nng_msg_len(m) - 256 : 0;
+        if (l >= sizeof tmp) l = sizeof tmp - 1;
+        memcpy(tmp, (uint8_t *)nng_msg_body(m) + 256, l); tmp[l] = 0;
+        nng_msg_free(m);
+        if (strstr(tmp, must)) snprintf(buf, cap, "%s", tmp);
+    }
+}
+
+static void t_heartbeat_lists_running(void) {
+    TEST("the heartbeat lists what is running, and nothing once it is done");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/tc_hb; mkdir -p /tmp/tc_hb");
+    char *a[] = { "./bin/actor", NULL };
+    char *e[] = { "ACTOR_BUS_SUB=" SP, "ACTOR_BUS_PUB=" PP, "ACTOR_HEARTBEAT_MS=200",
+                  "ACTOR_ID=tc", "ACTOR_TOPIC=work", "ACTOR_RESULT_TOPIC=done",
+                  "ACTOR_HANDLER=sh -c 'sleep 1.5; echo :ok'", "ACTOR_RETRY_MAX=0",
+                  "ACTOR_LMDB_PATH=/tmp/tc_hb", NULL };
+    pid_t ap = sp_(a, e); ms(700);
+    nng_socket hb = sub_open("heartbeat");
+    sendm_as("test", "work", "x", 0, 0, 0x41);
+    char busy[8192], idle[8192];
+    last_payload(hb, 900, "\"id\":\"tc\"", busy, sizeof busy);
+    ms(1200);
+    last_payload(hb, 600, "\"id\":\"tc\"", idle, sizeof idle);
+    nng_close(hb);
+    stop(pp, ap);
+    printf("  busy: %.170s\n  idle: %.170s\n", busy, idle);
+    CHECK(strstr(busy, "\"correlation\":\"41414141414141414141414141414141\"") &&
+          strstr(busy, "\"topic\":\"work\"") && strstr(busy, "\"terminating\":false"),
+          "the heartbeat did not list the running tuple");
+    CHECK(strstr(idle, "\"running\":[]") != NULL, "the heartbeat still listed a finished tuple");
+}
+
+/* ── 10. Deadline ─────────────────────────────────────────────────────────── */
+
+static void t_deadline_stops_retries(void) {
+    TEST("a tuple whose TTL passes between retries is not run again");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -f /tmp/tc_dl_log");
+    pid_t ap = start_actor("sh -c 'echo $ACTOR_ATTEMPT >> /tmp/tc_dl_log; exit 1'",
+                           "1", "5", "/tmp/tc_dl");
+    nng_socket rej = sub_open("tuple_rejected");
+    /* backoff wakes at ~0.1s, ~0.3s, ~0.7s: a 600ms TTL runs out before the third retry */
+    sendm("work", "x", 600000000LL, 0);
+    char reason[512] = {0};
+    int rejected = drain_n(rej, 5000, 1, reason, sizeof reason);
+    nng_close(rej);
+    stop(pp, ap);
+    char log[64]; slurp("/tmp/tc_dl_log", log, sizeof log);
+    printf("  rejected=%d attempts=[%s] %.100s\n", rejected, log, reason);
+    CHECK(rejected == 1 && strstr(reason, "\"reason\":\"ttl_expired\"") != NULL,
+          "not rejected as expired");
+    CHECK(strcmp(log, "0 1 2 ") == 0, "retried past the deadline");
+}
+
+static void t_deadline_reaches_handler(void) {
+    TEST("the handler sees its tuple's deadline in ACTOR_TUPLE_DEADLINE");
+    cleanup();
+    pid_t pp = start_proxy();
+    pid_t ap = start_actor("sh -c 'echo :$ACTOR_TUPLE_DEADLINE'", "1", "0", "/tmp/tc_dl2");
+    nng_socket done = sub_open("done");
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    int64_t emitted = ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    char with_ttl[128] = {0}, without[128] = {0};
+    sendm("work", "x", 60000000000LL, emitted);
+    drain_n(done, 3000, 1, with_ttl, sizeof with_ttl);
+    sendm("work", "y", 0, 0);
+    drain_n(done, 3000, 1, without, sizeof without);
+    nng_close(done);
+    stop(pp, ap);
+    printf("  with ttl: %.40s  without: %.40s\n", with_ttl, without);
+    CHECK(with_ttl[0] == ':' && atoll(with_ttl + 1) == emitted + 60000000000LL,
+          "ACTOR_TUPLE_DEADLINE is not emitted_at + ttl");
+    CHECK(strcmp(without, ":0\n") == 0, "a tuple without a TTL should have deadline 0");
+}
+
+/* ── 11. Lanes ─────────────────────────────────────────────────────────────── */
+
+static void t_lane_does_not_wait(void) {
+    TEST("a topic with its own handler is its own lane, and never waits behind another");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/tc_lane; mkdir -p /tmp/tc_lane");
+    char *a[] = { "./bin/actor", NULL };
+    char *e[] = { "ACTOR_BUS_SUB=" SP, "ACTOR_BUS_PUB=" PP, "ACTOR_HEARTBEAT_MS=0",
+                  "ACTOR_ID=tc", "ACTOR_TOPIC=work,ctl", "ACTOR_RESULT_TOPIC=done",
+                  "ACTOR_HANDLER=sh -c 'sleep 2; echo :slow'", "ACTOR_RETRY_MAX=0",
+                  "ACTOR_HANDLER_ctl=sh -c 'echo :fast'", "ACTOR_RESULT_TOPIC_ctl=ctl_done",
+                  "ACTOR_LMDB_PATH=/tmp/tc_lane", NULL };
+    pid_t ap = sp_(a, e); ms(700);
+    nng_socket ctl  = sub_open("ctl_done");
+    nng_socket done = sub_open("done");
+    sendm("work", "x", 0, 0);
+    ms(300);                                   /* the only default worker is busy */
+    int64_t t0 = now_ms();
+    sendm("ctl", "y", 0, 0);
+    char fast[64] = {0}, slow[64] = {0};
+    int got_ctl = drain_n(ctl, 1500, 1, fast, sizeof fast);
+    int64_t elapsed = now_ms() - t0;
+    int got_done = drain_n(done, 3000, 1, slow, sizeof slow);
+    nng_close(ctl); nng_close(done);
+    stop(pp, ap);
+    printf("  ctl answered in %lldms with %.6s; work gave %.6s\n",
+           (long long)elapsed, fast, slow);
+    CHECK(got_ctl == 1 && strncmp(fast, ":fast", 5) == 0,
+          "ctl was not served by its own handler and result topic");
+    CHECK(elapsed < 1000, "ctl waited behind the busy default lane");
+    CHECK(got_done == 1 && strncmp(slow, ":slow", 5) == 0, "the default lane lost its tuple");
+}
+
+static void t_lanes_overcommit_fails(void) {
+    TEST("lanes asking for more than 32 workers refuse to start");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -rf /tmp/tc_lane2; mkdir -p /tmp/tc_lane2");
+    char *a[] = { "./bin/actor", NULL };
+    char *e[] = { "ACTOR_BUS_SUB=" SP, "ACTOR_BUS_PUB=" PP, "ACTOR_HEARTBEAT_MS=0",
+                  "ACTOR_ID=tc", "ACTOR_TOPIC=work,ctl", "ACTOR_RESULT_TOPIC=done",
+                  "ACTOR_HANDLER=sh -c 'echo :ok'", "ACTOR_CONCURRENCY=20",
+                  "ACTOR_CONCURRENCY_ctl=20", "ACTOR_LMDB_PATH=/tmp/tc_lane2", NULL };
+    pid_t ap = sp_(a, e);
+    int gone = wait_exit(ap, 3000);
+    stop(pp, gone ? -1 : ap);
+    CHECK(gone, "an actor whose lanes ask for 40 workers started anyway");
+}
+
+/* ── 12. Init and services ────────────────────────────────────────────────── */
+
+/* The exit code, or -1 if p is still running after budget ms. */
+static int exit_code(pid_t p, int budget) {
+    for (int64_t end = now_ms() + budget; now_ms() < end; ms(50)) {
+        int st;
+        if (waitpid(p, &st, WNOHANG) == p)
+            return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+    }
+    return -1;
+}
+
+/* An actor on `work` with a fresh LMDB at dir, plus the given env entries. */
+static pid_t spawn_with(const char *dir, const char *const *extra) {
+    static char d[256];
+    snprintf(d, sizeof d, "ACTOR_LMDB_PATH=%s", dir);
+    char cmd[512]; snprintf(cmd, sizeof cmd, "rm -rf %s; mkdir -p %s", dir, dir);
+    system(cmd);
+    const char *e[24] = { "ACTOR_BUS_SUB=" SP, "ACTOR_BUS_PUB=" PP, "ACTOR_ID=tc",
+                          "ACTOR_TOPIC=work", "ACTOR_RESULT_TOPIC=done", "ACTOR_RETRY_MAX=0", d };
+    int n = 7;
+    for (; *extra && n < 23; extra++) e[n++] = *extra;
+    e[n] = NULL;
+    char *a[] = { "./bin/actor", NULL };
+    return sp_(a, (char **)e);
+}
+
+static void t_init_runs_before_serving(void) {
+    TEST("ACTOR_INIT runs to completion, and the actor serves after it");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -f /tmp/tc_init_mark");
+    const char *x[] = { "ACTOR_HEARTBEAT_MS=0",
+                        "ACTOR_INIT=sleep 0.3; echo ready > /tmp/tc_init_mark",
+                        "ACTOR_HANDLER=sh -c 'echo :$(cat /tmp/tc_init_mark)'", NULL };
+    pid_t ap = spawn_with("/tmp/tc_init", x);
+    nng_socket done = sub_open("done");
+    ms(900);
+    sendm("work", "x", 0, 0);
+    char got[64] = {0};
+    int n = drain_n(done, 3000, 1, got, sizeof got);
+    nng_close(done);
+    stop(pp, ap);
+    printf("  result=%.20s\n", got);
+    CHECK(n == 1 && strncmp(got, ":ready", 6) == 0, "the handler did not see ACTOR_INIT's work");
+}
+
+static void t_init_failure_stops(void) {
+    TEST("a failing ACTOR_INIT stops the actor");
+    cleanup();
+    pid_t pp = start_proxy();
+    const char *x[] = { "ACTOR_HEARTBEAT_MS=0", "ACTOR_INIT=exit 3",
+                        "ACTOR_HANDLER=sh -c 'echo :ok'", NULL };
+    pid_t ap = spawn_with("/tmp/tc_init2", x);
+    int code = exit_code(ap, 3000);
+    stop(pp, code >= 0 ? -1 : ap);
+    printf("  exit=%d\n", code);
+    CHECK(code > 0, "an actor whose ACTOR_INIT failed kept going");
+}
+
+static void t_service_restarts_then_gives_up(void) {
+    TEST("a service is restarted 5 times, then the actor gives up and exits non-zero");
+    cleanup();
+    pid_t pp = start_proxy();
+    system("rm -f /tmp/tc_svc_log");
+    const char *x[] = { "ACTOR_HEARTBEAT_MS=0", "ACTOR_HANDLER=sh -c 'echo :ok'",
+                        "ACTOR_SERVICE_flaky=echo up >> /tmp/tc_svc_log; sleep 0.2; exit 1", NULL };
+    pid_t ap = spawn_with("/tmp/tc_svc", x);
+    int code = exit_code(ap, 8000);
+    stop(pp, code >= 0 ? -1 : ap);
+    char log[256]; slurp("/tmp/tc_svc_log", log, sizeof log);
+    int starts = 0;
+    for (const char *p = log; (p = strstr(p, "up")); p += 2) starts++;
+    printf("  starts=%d exit=%d\n", starts, code);
+    CHECK(starts == 6, "not started once and restarted exactly 5 times");
+    CHECK(code > 0, "the actor did not exit non-zero once the restart budget ran out");
+}
+
+static void t_service_lives_with_the_actor(void) {
+    TEST("a service shows in the heartbeat and stops with the actor");
+    cleanup();
+    pid_t pp = start_proxy();
+    const char *x[] = { "ACTOR_HEARTBEAT_MS=200", "ACTOR_HANDLER=sh -c 'echo :ok'",
+                        "ACTOR_SERVICE_sleeper=sleep 35", NULL };
+    pid_t ap = spawn_with("/tmp/tc_svc2", x);
+    nng_socket hb = sub_open("heartbeat");
+    char beat[8192];
+    last_payload(hb, 800, "\"id\":\"tc\"", beat, sizeof beat);
+    nng_close(hb);
+    int running = procs_named("sleep 35");
+    kill(ap, SIGTERM);
+    int code = exit_code(ap, 5000);
+    int left = procs_named("sleep 35");
+    stop(pp, code >= 0 ? -1 : ap);
+    system("pkill -9 -x sleep 2>/dev/null");
+    printf("  running=%d left=%d exit=%d  %.150s\n", running, left, code, strstr(beat, "\"services\"") ? strstr(beat, "\"services\"") : beat);
+    CHECK(strstr(beat, "\"services\":[{\"name\":\"sleeper\"") != NULL,
+          "the heartbeat did not list the service");
+    CHECK(running == 1 && left == 0 && code == 0, "the service did not stop with the actor");
+}
+
+/* ── 13. Built-in bus ─────────────────────────────────────────────────────── */
+
+static void t_actor_hosts_the_bus(void) {
+    TEST("an actor with PROXY_*_BIND set is its own bus: no mesh-proxy needed");
+    cleanup();                                   /* no proxy is running */
+    const char *x[] = { "ACTOR_HEARTBEAT_MS=0", "ACTOR_HANDLER=sh -c 'echo :ok'",
+                        "PROXY_SUB_BIND=" PP, "PROXY_PUB_BIND=" SP, NULL };
+    pid_t ap = spawn_with("/tmp/tc_bus", x);
+    ms(700);
+    nng_socket done = sub_open("done");
+    sendm("work", "x", 0, 0);
+    char got[64] = {0};
+    int n = drain_n(done, 3000, 1, got, sizeof got);
+    nng_close(done);
+    stop(-1, ap);
+    printf("  result=%.10s\n", got);
+    CHECK(n == 1 && strncmp(got, ":ok", 3) == 0, "no result through the actor's own bus");
+}
+
+static void t_half_a_bus_fails(void) {
+    TEST("PROXY_SUB_BIND without PROXY_PUB_BIND refuses to start");
+    cleanup();
+    const char *x[] = { "ACTOR_HEARTBEAT_MS=0", "ACTOR_HANDLER=sh -c 'echo :ok'",
+                        "PROXY_SUB_BIND=" PP, NULL };
+    pid_t ap = spawn_with("/tmp/tc_bus2", x);
+    int code = exit_code(ap, 3000);
+    stop(-1, code >= 0 ? -1 : ap);
+    printf("  exit=%d\n", code);
+    CHECK(code > 0, "an actor with half a bus configured started anyway");
+}
+
 int main(void) {
     printf("actor concurrency tests\n\n");
     t_parallel();
@@ -319,6 +798,24 @@ int main(void) {
     t_orphans_reaped();
     t_ttl_expired_not_run();
     t_live_ttl_still_runs();
+    t_retry_attempts_and_backoff();
+    t_replay_after_crash();
+    t_stop_leaves_unfinished();
+    t_rejection_bounds_origin();
+    t_term_stops_the_group();
+    t_term_escalates_to_kill();
+    t_term_names_its_target();
+    t_heartbeat_lists_running();
+    t_deadline_stops_retries();
+    t_deadline_reaches_handler();
+    t_lane_does_not_wait();
+    t_lanes_overcommit_fails();
+    t_init_runs_before_serving();
+    t_init_failure_stops();
+    t_service_restarts_then_gives_up();
+    t_service_lives_with_the_actor();
+    t_actor_hosts_the_bus();
+    t_half_a_bus_fails();
     cleanup();
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED",
            failures, failures == 1 ? "" : "s");

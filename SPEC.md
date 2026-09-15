@@ -1,7 +1,7 @@
 # Actor Mesh — Formal Specification
 
-A distributed actor mesh built on Unix primitives. Runtime: 624 lines of C.
-Proxy: 193 lines of C. Handler: any process that speaks stdio.
+A distributed actor mesh built on Unix primitives. Runtime: ~1,500 lines of C.
+Proxy: ~130 lines of C. Handler: any process that speaks stdio.
 
 ---
 
@@ -167,6 +167,17 @@ payload(h : actor_header_t*) : uint8*  ≙  (uint8*)(h + 1)
 │                             ∧ tok = trim(tok) ∧ t = tok }           │
 │ Each subscription uses strlen(t)+1 bytes for exact match            │
 └─────────────────────────────────────────────────────────────────────┘
+
+Lane ≙ { topics ⊆ subscribers, handler, result_topic, concurrency, sub }
+  — a topic with any of ACTOR_{HANDLER,RESULT_TOPIC,CONCURRENCY}_<topic>
+    set gets a lane of its own; the others share one, which is every topic
+    when none is set. Σ lane.concurrency ≤ ACTOR_MAX_CONCURRENCY (32).
+
+Service ≙ { name, cmd, pid, restarts }        — ACTOR_SERVICE_<name>=<cmd>
+  — started before the first tuple, in its own process group; restarted by
+    the reaper when it exits; a 6th exit within 60s stops the actor, which
+    then exits non-zero. ACTOR_INIT runs once, to completion, before the
+    bus is joined. Unix only.
 ```
 
 ---
@@ -177,16 +188,17 @@ payload(h : actor_header_t*) : uint8*  ≙  (uint8*)(h + 1)
 ┌─ ProxyState ────────────────────────────────────────────────────────┐
 │ sub_sock       : nng_socket    — binds PROXY_SUB_BIND (sub0)        │
 │ pub_sock       : nng_socket    — binds PROXY_PUB_BIND (pub0)        │
-│ http_fd        : ℤ             — IPv6 TCP listener on :8082         │
 │ g_stop         : 𝔹             — true → exit                       │
 │ proxy_id       : char[32]      — PROXY_ID, default "proxy"          │
 │ hb_ms          : ℕ             — PROXY_HEARTBEAT_MS, default 5000   │
 ├─────────────────────────────────────────────────────────────────────┤
 │ sub_sock subscribes ""  — wildcard: receives ALL messages           │
 │ pub_sock binds all addresses in comma-separated URL list            │
-│ http_fd = −1  if port 8082 unavailable (non-fatal)                  │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+The forwarder is runtime/bus.c. An actor with both PROXY_SUB_BIND and
+PROXY_PUB_BIND set runs the same forwarder on a thread of its own (Unix).
 
 ---
 
@@ -202,7 +214,7 @@ payload(h : actor_header_t*) : uint8*  ≙  (uint8*)(h + 1)
 ├─────────────────────────────────────────────────────────────────────┤
 │ dom(inbox) ∩ dom(outbox) = ∅                                        │
 │ ∀ k ∈ dom(inbox) : k is the id of a tuple currently being processed │
-│ |inbox| ≤ 1 at any time (single-threaded actor)                     │
+│ |inbox| ≤ ACTOR_MAX_CONCURRENCY  (one per busy worker)              │
 │ Environment size ≤ 64 MiB                                            │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -214,12 +226,14 @@ Before processing  →  lmdb_put(inbox,  t.id, wire(t, p))
 After success       →  lmdb_del(inbox,  t.id)
                       [outbox was put and deleted within publish_result]
 After max retries   →  lmdb_del(inbox,  t.id)
+While stopping      →  no retry; a failed tuple stays in inbox
 
 On restart:
-  — inbox entries with pending NNG messages are re-received via normal poll
-  — no explicit inbox walk at startup (NNG replay covers it)
-  — outbox entries from crash-mid-publish are not replayed
-    (current implementation deletes outbox immediately after send)
+  — outbox is cleared; replaying the inbox supersedes it
+  — each inbox entry is processed again before new messages,
+    with attempt + 1, by the configured workers
+  — an entry past its TTL is rejected (ttl_expired) and deleted
+  — delivery is therefore at-least-once
 ```
 
 ---
@@ -254,7 +268,9 @@ setenv("ACTOR_TUPLE_ID",       hex(t.id),             1)
 setenv("ACTOR_CORRELATION_ID", hex(t.correlation_id), 1)
 setenv("ACTOR_CAUSATION_ID",   hex(t.causation_id),   1)
 setenv("ACTOR_TUPLE_ORIGIN",   t.origin,              1)
-setenv("ACTOR_ATTEMPT",        str(t.attempt),        1)
+setenv("ACTOR_ATTEMPT",        str(attempt),          1)  — retries and replays
+setenv("ACTOR_TUPLE_TOPIC",    t.topic,               1)
+setenv("ACTOR_TUPLE_DEADLINE", str(t.ttl ≠ 0 ? t.emitted_at + t.ttl : 0), 1)
 ```
 
 ### 6.3 Topic Routing by Handler
@@ -278,17 +294,18 @@ ParseTopicOverride(buf : uint8*, len : ℕ) : (Topic | null, ℕ)
 ### 6.4 Exit Code Semantics
 
 ```
-predicate HandlerSuccess(result_len : ℤ) ≙
-  result_len > 0
+RunStatus ::= RUN_OK | RUN_FAILED | RUN_TOO_LARGE | RUN_TERMINATED
 
-predicate HandlerEmpty(result_len : ℤ) ≙
-  result_len = 0
+RUN_OK         ≙ exited 0; result_len bytes are in g_result_buf
+                 (result_len = 0: nothing to publish, treated as done)
+RUN_FAILED     ≙ spawn failed, exited non-zero, or killed by a signal
+RUN_TOO_LARGE  ≙ output reached ACTOR_MAX_PAYLOAD
+RUN_TERMINATED ≙ stopped by _term: SIGTERM to its process group, then
+                 SIGKILL after ACTOR_TERM_GRACE_MS
 
-predicate HandlerOverflow(result_len : ℤ) ≙
-  result_len = −2
-
-predicate HandlerFailure(result_len : ℤ) ≙
-  result_len < 0  ∧  result_len ≠ −2
+RejectReason ::= payload_cap_exceeded | result_cap_exceeded
+               | max_retries_exceeded | ttl_expired | terminated
+               — the wire values of a tuple_rejected "reason"
 ```
 
 ---
@@ -312,12 +329,10 @@ procedure actor_run() : {0, −1}:
   if NngSetup(cfg) < 0: return −1
   if LmdbSetup(cfg) < 0: return −1
 
-  last_hb ← 0
+  — heartbeats come from the reaper thread every cfg.heartbeat_ms, so a
+    busy worker never delays them; on Windows, which has none, this loop
+    sends them
   while ¬g_stop:
-    if cfg.heartbeat_ms > 0  ∧  now_ms() − last_hb ≥ cfg.heartbeat_ms:
-      EmitHeartbeat(cfg.id)
-      last_hb ← now_ms()
-
     msg ← ⊥
     rc ← nng_recvmsg(nng_sub, &msg, 0)    — 100ms timeout
     if rc = NNG_ETIMEDOUT:  continue
@@ -356,18 +371,16 @@ procedure NngSetup(cfg : ActorConfig) : {0, −1}:
     sleep(1)
   if not connected: return −1
 
-  if nng_sub0_open(&nng_sub) ≠ 0: return −1
-  for i ∈ [0, 30):
-    if nng_dial(nng_sub, cfg.bus_sub_url, ...) = 0: break
-    sleep(1)
-  if not connected: return −1
-
-  for each tok ∈ split(cfg.topic_list, ','):
-    tok ← trim(tok)
-    nng_socket_set(nng_sub, NNG_OPT_SUB_SUBSCRIBE, tok, strlen(tok) + 1)
-    — +1 includes null byte for exact (non-prefix) match
-
-  nng_socket_set_ms(nng_sub, NNG_OPT_RECVTIMEO, 100)
+  for each lane ∈ lanes:                  — one SUB socket per lane (§3.3)
+    if nng_sub0_open(&lane.sub) ≠ 0: return −1
+    for i ∈ [0, 30):
+      if nng_dial(lane.sub, cfg.bus_sub_url, ...) = 0: break
+      sleep(1)
+    if not connected: return −1
+    for each tok ∈ split(lane.topics, ','):
+      nng_socket_set(lane.sub, NNG_OPT_SUB_SUBSCRIBE, tok, strlen(tok) + 1)
+      — +1 includes null byte for exact (non-prefix) match
+    nng_socket_set_ms(lane.sub, NNG_OPT_RECVTIMEO, 100)
   return 0
 ```
 
@@ -388,26 +401,31 @@ procedure ProcessTuple(hdr : actor_header_t*, payload : uint8*,
 
   attempt ← 0
   while attempt ≤ cfg.retry_max:
-    result_len ← InvokeHandler(hdr, payload, plen)
+    (run, result_len) ← InvokeHandler(hdr, payload, plen, hdr.attempt + attempt)
 
-    if HandlerSuccess(result_len):
-      PublishResult(hdr, result_len)
+    if run = RUN_OK:
+      if result_len > 0: PublishResult(hdr, result_len)
       break
 
-    if HandlerEmpty(result_len):
-      break  — nothing to publish, treat as done
-
-    if HandlerOverflow(result_len):
+    if run = RUN_TOO_LARGE:
       PublishRejection(hdr, "result_cap_exceeded")
       break  — no retry on overflow
 
-    — handler failure
+    if run = RUN_TERMINATED:
+      PublishRejection(hdr, "terminated")
+      break  — deliberate: neither retried nor replayed
+
+    — RUN_FAILED
+    if g_stop: return  — stays in the inbox for the next run (§5.2)
     attempt ← attempt + 1
     if attempt > cfg.retry_max:
       PublishRejection(hdr, "max_retries_exceeded")
       break
 
     nanosleep(backoff(attempt))
+    if Expired(hdr):
+      PublishRejection(hdr, "ttl_expired")
+      break  — the caller gave up while we waited
     log("retry %d/%d", attempt, cfg.retry_max)
 
   LmdbDel(dbi_inbox, hdr.id, 16)
@@ -417,13 +435,12 @@ procedure ProcessTuple(hdr : actor_header_t*, payload : uint8*,
 
 ```
 procedure InvokeHandler(hdr : actor_header_t*, payload : uint8*,
-                        plen : ℕ) : ℤ:
-  { post: result ∈ {−2, −1, 0} ∪ [1, ACTOR_MAX_PAYLOAD]           }
+                        plen : ℕ, attempt : ℕ) : (RunStatus, ℕ):
+  { post: result_len ≤ ACTOR_MAX_PAYLOAD                          }
 
-  SetHeaderEnvVars(hdr)    — §6.2
+  SetHeaderEnvVars(hdr, attempt)    — §6.2
 
-  result_len ← PlatformSpawn(payload, plen, g_result_buf, ACTOR_MAX_PAYLOAD)
-  return result_len
+  return PlatformSpawn(payload, plen, g_result_buf, ACTOR_MAX_PAYLOAD)
 ```
 
 ### 7.5 PublishResult
@@ -482,7 +499,11 @@ procedure PublishRejection(in_hdr : actor_header_t*, reason : char[*]):
 procedure EmitHeartbeat(id : char[32]):
   inbox_sz  ← LmdbCount(dbi_inbox)
   outbox_sz ← LmdbCount(dbi_outbox)
-  payload   ← FormatJson({ id: id, inbox: inbox_sz, outbox: outbox_sz })
+  running   ← [ { tuple, correlation, topic, pid, age_ms, terminating }
+                | slot ∈ children, slot busy ]      — [] on Windows
+  payload   ← FormatJson({ id: id, inbox: inbox_sz, outbox: outbox_sz,
+                           running: running,
+                           services: [ { name, pid, restarts } ] })
   plen      ← strlen(payload)
 
   Init(&hdr, "heartbeat", id, null, null, plen)
@@ -499,7 +520,6 @@ procedure EmitHeartbeat(id : char[32]):
 procedure proxy_main():
   signal(SIGTERM, → g_stop ← 1)
   signal(SIGINT,  → g_stop ← 1)
-  signal(SIGCHLD, SIG_IGN)           — reap forked HTTP children
 
   sub ← Sub0Open()
   pub ← Pub0Open()
@@ -509,20 +529,11 @@ procedure proxy_main():
   ListenAll(pub, PROXY_PUB_BIND)     — "tcp://*:5556" default
   SetRecvTimeout(sub, 100ms)
 
-  — HTTP bridge (optional, non-blocking)
-  http_fd ← TcpListen(:8082, NONBLOCK)
-
   last_hb ← 0
   while ¬g_stop:
     if now_ms() − last_hb ≥ hb_ms:
       EmitHeartbeat(proxy_id)
       last_hb ← now_ms()
-
-    — HTTP accept (non-blocking)
-    cfd ← accept(http_fd, ...)
-    if cfd ≥ 0:
-      HttpHandle(cfd)    — inline: parse POST, publish via nngcat popen
-      close(cfd)
 
     — Mesh forwarding
     msg ← ⊥
@@ -532,7 +543,6 @@ procedure proxy_main():
     nng_sendmsg(pub, msg, 0)         — forward to all subscribers
     nng_msg_free(msg)
 
-  close(http_fd)
   nng_close(pub)
   nng_close(sub)
 ```
@@ -541,7 +551,7 @@ procedure proxy_main():
 
 ```
 procedure PlatformSpawn(stdin_data : uint8*, in_len : ℕ,
-                        stdout_buf : uint8*, out_cap : ℕ) : ℤ:
+                        stdout_buf : uint8*, out_cap : ℕ) : (RunStatus, ℕ):
   { pre:  out_cap = ACTOR_MAX_PAYLOAD                                 }
 
   — Unix path
@@ -569,14 +579,14 @@ procedure PlatformSpawn(stdin_data : uint8*, in_len : ℕ,
       drain remaining bytes   — read and discard until EOF
       close(from_child[0])
       waitpid(pid, ...)
-      return −2               — overflow
+      return (RUN_TOO_LARGE, 0)
 
   close(from_child[0])
   waitpid(pid, &status, 0)
 
-  if WIFEXITED(status) ∧ WEXITSTATUS(status) ≠ 0:
-    return −1                  — handler error
-  return len
+  if ¬WIFEXITED(status) ∨ WEXITSTATUS(status) ≠ 0:
+    return (RUN_FAILED, 0)     — handler error or signal
+  return (RUN_OK, len)
 ```
 
 ---
@@ -616,19 +626,19 @@ predicate PayloadAcceptable(plen : ℕ) ≙
 ### 8.4 Result Valid
 
 ```
-predicate ResultAcceptable(result_len : ℤ) ≙
-  −2 ≤ result_len ≤ ACTOR_MAX_PAYLOAD
-  ∧ (result_len > 0  ⇒  handler wrote valid output)
-  ∧ (result_len = 0  ⇒  handler wrote nothing — treat as success)
-  ∧ (result_len = −1 ⇒  handler exited non-zero or spawn failed)
-  ∧ (result_len = −2 ⇒  handler output exceeded ACTOR_MAX_PAYLOAD)
+predicate ResultAcceptable(run : RunStatus, result_len : ℕ) ≙
+  result_len ≤ ACTOR_MAX_PAYLOAD
+  ∧ (run = RUN_OK        ⇒  handler exited 0; result_len = 0 means nothing to publish)
+  ∧ (run = RUN_FAILED    ⇒  handler exited non-zero, was signalled, or spawn failed)
+  ∧ (run = RUN_TOO_LARGE ⇒  handler output reached ACTOR_MAX_PAYLOAD)
 ```
 
 ### 8.5 Retry Deserves
 
 ```
-predicate RetryWarranted(result_len : ℤ, attempt : ℕ, retry_max : ℕ₀) ≙
-  result_len = −1                    — handler failure
+predicate RetryWarranted(run : RunStatus, attempt : ℕ, retry_max : ℕ₀) ≙
+  run = RUN_FAILED                   — handler failure
+  ∧ ¬g_stop                          — never while stopping
   ∧ attempt ≤ retry_max             — retries remaining
 ```
 
@@ -695,7 +705,7 @@ predicate TopicMatch(msg_topic : Topic, sub_topic : Topic) ≙
 ```
 ┌─ Durability Invariants ─────────────────────────────────────────────┐
 │ DI1: At most one tuple in processing at any time                    │
-│      |inbox| ≤ 1  (single-threaded actor)                           │
+│      |inbox| ≤ ACTOR_MAX_CONCURRENCY  (one per busy worker)         │
 │                                                                     │
 │ DI2: inbox and outbox are disjoint                                  │
 │      dom(inbox) ∩ dom(outbox) = ∅                                   │
@@ -862,7 +872,6 @@ procedure ParseCausationId(frame : uint8*, flen : ℕ, out : UUID):
 │ PROXY_HEARTBEAT_MS   : ℕ        — optional, default 5000            │
 ├─────────────────────────────────────────────────────────────────────┤
 │ Bind URLs support comma-separated lists for multi-homed hosts       │
-│ HTTP bridge on :8082 is always-on (fails silently if port in use)   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 

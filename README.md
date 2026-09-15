@@ -3,7 +3,7 @@
 A minimal distributed actor mesh built on Unix primitives.  
 No frameworks. No sidecars. No brokers. Just processes.
 
-**Runtime:** ~624 lines of C &nbsp;|&nbsp; **Proxy:** ~193 lines of C &nbsp;|&nbsp; **Handler:** any process that speaks stdio
+**Runtime:** ~1,500 lines of C, plus ~1,300 of optional isolation &nbsp;|&nbsp; **Proxy:** ~130 lines of C &nbsp;|&nbsp; **Handler:** any process that speaks stdio
 
 ---
 
@@ -55,7 +55,7 @@ bash test-mcp-mesh.sh "how many employees?"
 | Binary | Purpose |
 |--------|---------|
 | `bin/actor` | Runtime — forks handlers, manages LMDB, connects to mesh |
-| `bin/mesh-proxy` | Bus — forwards pub/sub messages, ~193 LOC |
+| `bin/mesh-proxy` | Bus — forwards pub/sub messages, ~130 LOC |
 | `bin/llm-agent` | ReAct agent handler — calls LLM, uses tools |
 
 ## Adding Your Own Agent
@@ -86,8 +86,7 @@ ACTOR_BUS_PUB=tcp://127.0.0.1:5557 \
 ## Tests
 
 ```sh
-gcc -Wall -O2 -std=c11 tests/test-mesh.c -lnng -o bin/test-mesh
-./bin/test-mesh              # 10/10 — proxy, actor, handler contract, TTL
+make test-mesh               # 10/10 — proxy, actor, handler contract, TTL, registry
 
 make test-concurrency        # ACTOR_CONCURRENCY and child reaping
 make test-isolation          # ACTOR_* confinement (Linux)
