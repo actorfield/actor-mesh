@@ -142,7 +142,8 @@ static void t6(void){ TEST("actor: TTL expiry");
         "ACTOR_TTL_NS=1000000",NULL};
     pid_t ap=sp(aa,ae); ms(600);
     nng_socket s; nng_pub0_open(&s); nng_dial(s,PP,NULL,0); ms(50);
-    uint8_t f[257]={0}; memcpy(f,"ttl_in",6); int64_t ttl=1; memcpy(f+120,&ttl,8); f[256]='x';
+    /* emitted_at set, long past: a 0 would be stamped on arrival (t11). */
+    uint8_t f[257]={0}; memcpy(f,"ttl_in",6); int64_t at=1,ttl=1; memcpy(f+112,&at,8); memcpy(f+120,&ttl,8); f[256]='x';
     nng_send(s,f,257,0); nng_close(s);
     CHECK(recvm("ttl_out",NULL,0,2000)<0,"expired processed");
     kill(pp,SIGKILL); kill(ap,SIGKILL); waitpid(pp,NULL,0); waitpid(ap,NULL,0);
@@ -230,9 +231,28 @@ static void t10(void){ TEST("heartbeat: actors emit");
     kill(pp,SIGKILL); kill(ap,SIGKILL); waitpid(pp,NULL,0); waitpid(ap,NULL,0);
 }
 
+static void t11(void){ TEST("actor: an unset emitted_at is stamped on arrival");
+    free_ports(); cleanup();
+    char *a[]={"./bin/mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
+    pid_t pp=sp(a,e); ms(600);
+    system("mkdir -p /tmp/tm11");
+    char *aa[]={"./bin/actor",NULL},*ae[]={
+        "ACTOR_BUS_SUB=tcp://127.0.0.1:55656","ACTOR_BUS_PUB=tcp://127.0.0.1:55657",
+        "ACTOR_HEARTBEAT_MS=0","ACTOR_ID=a11","ACTOR_TOPIC=st_in","ACTOR_RESULT_TOPIC=st_out",
+        "ACTOR_HANDLER=sh -c 'echo st_out; echo ok'","ACTOR_LMDB_PATH=/tmp/tm11",NULL};
+    pid_t ap=sp(aa,ae); ms(600);
+    /* A ttl and no emitted_at: judged against 0, it would be long expired. */
+    nng_socket s; nng_pub0_open(&s); nng_dial(s,PP,NULL,0); ms(50);
+    uint8_t f[257]={0}; memcpy(f,"st_in",5); int64_t ttl=10000000000LL; memcpy(f+120,&ttl,8);
+    uint32_t pl=1; memcpy(f+132,&pl,4); f[256]='x';
+    nng_send(s,f,257,0); nng_close(s);
+    CHECK(recvm("st_out",NULL,0,3000)>0,"unset emitted_at treated as expired");
+    kill(pp,SIGKILL); kill(ap,SIGKILL); waitpid(pp,NULL,0); waitpid(ap,NULL,0);
+}
+
 int main(void){
     printf("Actor Mesh Test Suite\n\n");
-    t1(); t2(); t3(); t4(); t5(); t6(); t7(); t8(); t9(); t10();
-    printf("\n%s (%d/%d failures)\n",failures?"FAIL":"ALL PASSED",failures,10);
+    t1(); t2(); t3(); t4(); t5(); t6(); t7(); t8(); t9(); t10(); t11();
+    printf("\n%s (%d/%d failures)\n",failures?"FAIL":"ALL PASSED",failures,11);
     cleanup(); return failures;
 }

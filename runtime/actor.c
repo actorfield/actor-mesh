@@ -1357,6 +1357,20 @@ static bool serve_once(int lane) {
         return true;
     }
 
+    /* A producer whose clock the runtime can't trust leaves emitted_at at 0,
+       and the first actor to receive the tuple stamps it from its own clock.
+       TTL is judged as now > emitted_at + ttl, so a stamp from a skewed clock
+       would expire tuples early or never. Stamped before the inbox write, so
+       a replay keeps it. */
+    if (source == TUPLE_RECEIVED) {
+        actor_header_t* in = (actor_header_t*)nng_msg_body(msg);
+        if (in->emitted_at == 0) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            in->emitted_at = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+        }
+    }
+
     const actor_header_t* hdr         = (const actor_header_t*)frame;
     const uint8_t*        payload     = frame + sizeof(actor_header_t);
     size_t                payload_len = frame_len - sizeof(actor_header_t);
