@@ -1,0 +1,24 @@
+# nng.pc — pkg-config shim for local development.
+#
+# Homebrew's nng formula installs the headers and library but ships no .pc
+# file, so pkg-config cannot find nng on macOS. This file supplies one so that
+# `pkg-config --cflags nng` / `--libs nng` resolve to the Homebrew keg.
+#
+# The Makefile puts this directory on PKG_CONFIG_PATH on Darwin only; Linux
+# distro packages (libnng-dev / nng-devel) register their own nng.pc and are
+# left untouched.
+#
+# prefix is the Homebrew keg. Apple Silicon: /opt/homebrew/opt/nng.
+# Intel Macs: change to /usr/local/opt/nng.
+
+prefix=/opt/homebrew/opt/nng
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: nng
+Description: nanomsg-next-generation (lightweight, brokerless messaging)
+Version: 1.12.4
+Libs: -L${libdir} -lnng
+Libs.private: -lpthread
+Cflags: -I${includedir}

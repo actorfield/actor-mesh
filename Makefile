@@ -26,9 +26,54 @@ ifeq ($(shell which $(CC) 2>/dev/null),)
   endif
   CC := $(ZIG) cc
 endif
-CFLAGS  = -Wall -Wextra -O2 -std=c11 -Iruntime
+# ── Dependencies (pkg-config) ──────────────────────────────────────────────
+# Include and library paths follow the installed nng/lmdb rather than being
+# hard-coded. Homebrew's nng keg ships no .pc file, so pkgconfig/nng.pc in this
+# repo supplies one; lmdb ships its own under the keg. On macOS the local
+# pkgconfig dir and the Homebrew kegs go on the search path; Linux distro
+# packages already register both, so nothing is overridden there.
+#
+# pkg-config describes the HOST system, so it is only consulted for native
+# builds. Cross builds (TARGET != native) keep plain library names and rely on
+# the target sysroot / CPATH, exactly as before.
+NNG_CFLAGS  :=
+NNG_LIBS    := -lnng
+LMDB_CFLAGS :=
+LMDB_LIBS   := -llmdb
+
+ifeq ($(TARGET),native)
+UNAME_S     := $(shell uname -s)
+BREW_PREFIX ?= $(shell brew --prefix 2>/dev/null)
+ifeq ($(UNAME_S),Darwin)
+PKG_CONFIG_PATH := $(CURDIR)/pkgconfig:$(BREW_PREFIX)/opt/lmdb/lib/pkgconfig:$(BREW_PREFIX)/lib/pkgconfig
+endif
+
+# Exported for sub-makes, and passed inline to the lookups below so the path is
+# honoured even when the ambient environment would not include it.
+export PKG_CONFIG_PATH
+PC_ENV = $(if $(PKG_CONFIG_PATH),PKG_CONFIG_PATH='$(PKG_CONFIG_PATH)')
+
+PKG_CONFIG  ?= pkg-config
+NNG_CFLAGS  := $(shell $(PC_ENV) $(PKG_CONFIG) --cflags nng  2>/dev/null)
+NNG_LIBS    := $(shell $(PC_ENV) $(PKG_CONFIG) --libs   nng  2>/dev/null)
+LMDB_CFLAGS := $(shell $(PC_ENV) $(PKG_CONFIG) --cflags lmdb 2>/dev/null)
+LMDB_LIBS   := $(shell $(PC_ENV) $(PKG_CONFIG) --libs   lmdb 2>/dev/null)
+
+# Where pkg-config is unavailable -- e.g. the Alpine build images, which rely
+# on CPATH/LIBRARY_PATH instead -- fall back to plain library names.
+ifeq ($(strip $(NNG_LIBS)),)
+NNG_CFLAGS :=
+NNG_LIBS   := -lnng
+endif
+ifeq ($(strip $(LMDB_LIBS)),)
+LMDB_CFLAGS :=
+LMDB_LIBS   := -llmdb
+endif
+endif
+
+CFLAGS  = -Wall -Wextra -O2 -std=c11 -Iruntime $(NNG_CFLAGS) $(LMDB_CFLAGS)
 LDFLAGS =
-LIBS    = -lnng -llmdb
+LIBS    = $(NNG_LIBS) $(LMDB_LIBS)
 
 ifdef ACTOR_MAX_PAYLOAD
 CFLAGS += -DACTOR_MAX_PAYLOAD=$(ACTOR_MAX_PAYLOAD)
@@ -60,19 +105,19 @@ actor-confine: tools/actor-confine.c runtime/actor_isolation.c runtime/actor_iso
 # reads frames with the example mpack-get helper, so build that too.
 test-mesh: actor mesh-proxy tests/test-mesh.c | bin/
 	$(MAKE) -C examples/employee-mesh handlers/lib/mpack-get
-	$(CC) $(CFLAGS) $(LDFLAGS) tests/test-mesh.c -lnng -o bin/test-mesh
+	$(CC) $(CFLAGS) $(LDFLAGS) tests/test-mesh.c $(NNG_LIBS) -o bin/test-mesh
 	./bin/test-mesh
 
 # Concurrency / child-reaping tests. Needs actor + mesh-proxy built first;
 # run from the repo root so ./bin/... resolves.
 test-concurrency: actor mesh-proxy tests/test-concurrency.c | bin/
-	$(CC) $(CFLAGS) $(LDFLAGS) tests/test-concurrency.c -lnng -o bin/test-concurrency
+	$(CC) $(CFLAGS) $(LDFLAGS) tests/test-concurrency.c $(NNG_LIBS) -o bin/test-concurrency
 	./bin/test-concurrency
 
 # Isolation tests. Needs actor + mesh-proxy built first; run from the repo
 # root so ./bin/... resolves.
 test-isolation: actor mesh-proxy actor-confine tests/test-isolation.c | bin/
-	$(CC) $(CFLAGS) $(LDFLAGS) tests/test-isolation.c -lnng -o bin/test-isolation
+	$(CC) $(CFLAGS) $(LDFLAGS) tests/test-isolation.c $(NNG_LIBS) -o bin/test-isolation
 	./bin/test-isolation
 
 clean:
