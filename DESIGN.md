@@ -17,9 +17,9 @@ Everything in the mesh is an Actor. The only difference between actor types
 is what they subscribe to and what handler they run.
 
 ```
-SQL Tool    →  actor + handlers/sqlite-tool   subscribes to: sql_query
-LLM Agent   →  actor + handlers/llm-agent     subscribes to: user_message, sql_result
-Observer    →  actor + <any handler>           subscribes to: heartbeat
+SQL Tool    →  actor + <sql handler>          subscribes to: sql_query
+LLM Agent   →  actor + <agent handler>        subscribes to: user_message, sql_result
+Observer    →  actor + <any handler>          subscribes to: heartbeat
 ```
 
 One binary. Config and handler define behaviour.
@@ -132,8 +132,8 @@ One actor instance receives tuples on all listed topics.
 A topic can have its own handler, result topic or concurrency:
 
 ```sh
-ACTOR_TOPIC=sql_query,cancel
-ACTOR_HANDLER=./handlers/sqlite-tool   ACTOR_CONCURRENCY=4
+ACTOR_TOPIC=work,cancel
+ACTOR_HANDLER=./handlers/worker        ACTOR_CONCURRENCY=4
 ACTOR_HANDLER_cancel=./handlers/cancel ACTOR_CONCURRENCY_cancel=1
 ```
 
@@ -379,9 +379,9 @@ right place for it.
 ### Example
 
 ```sh
-ACTOR_ID=sqlite-tool-1 \
-ACTOR_TOPIC=sql_query ACTOR_RESULT_TOPIC=sql_result \
-ACTOR_HANDLER=/handlers/sqlite-tool \
+ACTOR_ID=worker-1 \
+ACTOR_TOPIC=work ACTOR_RESULT_TOPIC=result \
+ACTOR_HANDLER=/handlers/worker \
 ACTOR_LMDB_PATH=/var/actor/db \
 ACTOR_UID=61000 ACTOR_GID=61000 \
 ACTOR_RLIMIT_AS=536870912 ACTOR_RLIMIT_NOFILE=256 \
@@ -399,8 +399,8 @@ ACTOR_SECCOMP=permissive_mount \
 Every actor emits a heartbeat tuple periodically, listing what it is running:
 
 ```json
-{"id": "sqlite-tool-1", "inbox": 1, "outbox": 0,
- "running": [{"tuple": "0190…", "correlation": "0190…", "topic": "sql_query",
+{"id": "worker-1", "inbox": 1, "outbox": 0,
+ "running": [{"tuple": "0190…", "correlation": "0190…", "topic": "work",
               "pid": 4312, "age_ms": 850, "terminating": false}],
  "services": [{"name": "web", "pid": 4100, "restarts": 0}]}
 ```
@@ -569,14 +569,7 @@ actor-mesh/
 ├── proxy/
 │   └── proxy.c                 heartbeat around the shared forwarder
 ├── examples/
-│   └── employee-mesh/          HR Q&A demo (ReAct loop over SQLite)
-│       ├── Makefile            build + run + query
-│       ├── client.c            CLI client — sends query, prints answer
-│       ├── handlers/
-│       │   ├── llm-agent.c     ReAct agent — Ollama + LMDB state
-│       │   └── sqlite-tool.c   SQL executor — reads EMPLOYEE_DB
-│       └── db/
-│           └── employee.db     sample employee database
+│   └── ping-pong/              two-actor pub/sub example
 └── vendor/
     ├── cjson/                  cJSON v1.7.18
     ├── mpack/                  MessagePack
@@ -590,13 +583,6 @@ actor-mesh/
 ```bash
 # runtime
 make
-
-# employee-mesh demo
-cd examples/employee-mesh
-make
-make run
-make query Q="who manages the Development department?"
-make stop
 ```
 
 ---
@@ -606,13 +592,13 @@ make stop
 **Bare process:**
 ```sh
 ./mesh-proxy &
-ACTOR_ID=sqlite-tool-1 \
-ACTOR_TOPIC=sql_query \
-ACTOR_RESULT_TOPIC=sql_result \
+ACTOR_ID=worker-1 \
+ACTOR_TOPIC=work \
+ACTOR_RESULT_TOPIC=result \
 ACTOR_BUS_SUB=tcp://localhost:5556 \
 ACTOR_BUS_PUB=tcp://localhost:5557 \
-ACTOR_HANDLER=./handlers/sqlite-tool \
-ACTOR_LMDB_PATH=/var/actor/sqlite-tool \
+ACTOR_HANDLER=./handlers/worker \
+ACTOR_LMDB_PATH=/var/actor/worker \
 ./actor &
 ```
 
@@ -622,15 +608,15 @@ env:
   - name: ACTOR_ID
     valueFrom: { fieldRef: { fieldPath: metadata.name } }
   - name: ACTOR_TOPIC
-    value: sql_query
+    value: work
   - name: ACTOR_RESULT_TOPIC
-    value: sql_result
+    value: result
   - name: ACTOR_BUS_SUB
     value: tcp://proxy:5556
   - name: ACTOR_BUS_PUB
     value: tcp://proxy:5557
   - name: ACTOR_HANDLER
-    value: /handlers/sqlite-tool
+    value: /handlers/worker
   - name: ACTOR_LMDB_PATH
     value: /var/actor/lmdb
 ```

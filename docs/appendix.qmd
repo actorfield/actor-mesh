@@ -49,31 +49,12 @@ The difference: C native, zero framework, same binary from edge to cloud.
 | `ACTOR_ATTEMPT` | runtime | Retry count (0 = first delivery) |
 | `ACTOR_LMDB_PATH` | runtime | Path to actor's LMDB directory |
 
-### Employee Mesh Handler Env Vars
-
-| Variable | Handler | Default | Description |
-|---|---|---|---|
-| `OLLAMA_URL` | llm-agent | `http://localhost:11434` | Ollama API endpoint |
-| `OLLAMA_MODEL` | llm-agent | `gemma4:e2b` | Model name |
-| `OLLAMA_API_KEY` | llm-agent | — | Bearer token for external APIs |
-| `EMPLOYEE_DB` | llm-agent, sqlite-tool | `./employee.db` | SQLite database path |
-| `PII_MODE` | pii-filter | `mask` | `mask` or `restore` |
-| `TOKENMAP_PATH` | pii-filter | — | LMDB token map directory |
-| `NER_MODEL_PATH` | pii-filter | — | ONNX NER model path |
-
 ## Topic Reference {.unnumbered}
 
 | Topic | Publisher | Subscriber | Contains |
 |---|---|---|---|
-| `user_message` | client/tui | tokenise | Raw user query with real names |
-| `user_message_masked` | tokenise | llm-agent | Query with entity tokens |
-| `sql_query` | detokenise | sqlite-tool | Detokenised SQL |
-| `sql_result` | sqlite-tool | tokenise | Raw DB rows with real PII |
-| `sql_result_masked` | tokenise | llm-agent | DB rows with PII tokens |
-| `sql_query_masked` | llm-agent | detokenise | SQL with entity tokens |
-| `agent_response_masked` | llm-agent | detokenise | Answer with PII tokens |
-| `agent_response` | detokenise | client/tui | Clean restored answer |
-| `heartbeat` | all actors | tui/monitors | Actor status and inbox/outbox counts |
+| `heartbeat` | all actors | monitors | Actor status and inbox/outbox counts |
+| `tuple_rejected` | runtime | senders | Rejection reason and causation id |
 
 ## Glossary {.unnumbered}
 

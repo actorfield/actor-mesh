@@ -912,7 +912,6 @@ vendor/
   nng/       — fetched at build time (NNG transport)
 
 Runtime source:        0 vendored deps (only nng + lmdb, linked dynamically)
-Handler examples:      cjson, mpack, smhasher, libcurl, libsqlite3, onnxruntime
 UI:                    clay.h + SDL2
 ```
 
@@ -951,8 +950,6 @@ test-mesh.c  — 10 integration tests
   8. handler: topic route      — handler can override result topic
   9. registry: store tool      — tool registry persists announcements
   10. heartbeat: actors emit   — heartbeat messages are published
-
-test-employee.c — 9 integration tests (requires LLM API key or Ollama)
 ```
 
 ### 13.2 Test Invariants

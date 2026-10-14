@@ -1,6 +1,6 @@
 # Preface {.unnumbered}
 
-An actor mesh is three ideas held together tightly: a **message bus** that nobody owns, **actors** that share nothing, and **handlers** that are just processes. Everything else — AI agents, tool-calling loops, stateful conversations — falls out of those three ideas without modification.
+An actor mesh is three ideas held together tightly: a **message bus** that nobody owns, **actors** that share nothing, and **handlers** that are just processes. Everything else — long-running workflows, tool-calling loops, stateful conversations — falls out of those three ideas without modification.
 
 ```{=html}
 <div class="stat-row">
@@ -15,8 +15,7 @@ An actor mesh is three ideas held together tightly: a **message bus** that nobod
 The runtime is ~506 lines of C. The proxy is 57 lines of C. A handler is any process that speaks stdio — a shell script, a Python file, a compiled binary. The same actor binary runs every role; config and handler define behaviour.
 
 ```
-SQL Tool   →  actor + handlers/sqlite-tool   subscribes to: sql_query
-LLM Agent  →  actor + handlers/llm-agent     subscribes to: user_message, sql_result
+Worker     →  actor + handlers/worker        subscribes to: work
 Observer   →  actor + <any handler>          subscribes to: heartbeat
 ```
 

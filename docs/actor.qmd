@@ -75,7 +75,7 @@ stateDiagram-v2
 ACTOR_TOPIC=user_message,sql_result ./actor
 ```
 
-This is what makes stateful multi-round patterns possible. The llm-agent subscribes to both `user_message` (the initial query) and `sql_result` (the tool response). Both arrive as separate tuple invocations. The correlation ID and LMDB state tie them into a single logical turn — no special runtime support required, just topic subscription.
+This is what makes stateful multi-round patterns possible. An actor subscribes to both `user_message` (the initial query) and `sql_result` (the tool response). Both arrive as separate tuple invocations. The correlation ID and LMDB state tie them into a single logical turn — no special runtime support required, just topic subscription.
 
 ::: {.callout}
 **The handler does not know which topic triggered it.** It reads `stdin` and writes `stdout`. If the handler needs to branch on topic, it reads `ACTOR_TUPLE_ORIGIN` or inspects a field in the payload — that is a handler concern, not a runtime concern.
@@ -132,13 +132,13 @@ Subscribe to `tuple_rejected` to implement dead-letter handling, surface errors 
 ```sh
 ./mesh-proxy &
 
-ACTOR_ID=sqlite-tool-1 \
-ACTOR_TOPIC=sql_query \
-ACTOR_RESULT_TOPIC=sql_result \
+ACTOR_ID=worker-1 \
+ACTOR_TOPIC=work \
+ACTOR_RESULT_TOPIC=result \
 ACTOR_BUS_SUB=tcp://localhost:5556 \
 ACTOR_BUS_PUB=tcp://localhost:5557 \
-ACTOR_HANDLER=./handlers/sqlite-tool \
-ACTOR_LMDB_PATH=/var/actor/sqlite-tool \
+ACTOR_HANDLER=./handlers/worker \
+ACTOR_LMDB_PATH=/var/actor/worker \
 ./actor &
 ```
 
@@ -149,13 +149,13 @@ env:
   - name: ACTOR_ID
     valueFrom: { fieldRef: { fieldPath: metadata.name } }
   - name: ACTOR_TOPIC
-    value: sql_query
+    value: work
   - name: ACTOR_BUS_SUB
     value: tcp://proxy:5556
   - name: ACTOR_BUS_PUB
     value: tcp://proxy:5557
   - name: ACTOR_HANDLER
-    value: /handlers/sqlite-tool
+    value: /handlers/worker
   - name: ACTOR_LMDB_PATH
     value: /var/actor/lmdb
 ```

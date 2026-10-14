@@ -29,10 +29,10 @@ static void cleanup(void) {
 static pid_t sp(char **a, char **e) { pid_t p; posix_spawn(&p, a[0], NULL, NULL, a, e); return p; }
 
 /* Frame buffer is header + payload. It was f[261] -- 256 bytes of header and
-   room for only 5 payload bytes -- so any test sending more (t9's 52-byte
-   msgpack announce) wrote past the end of the stack buffer and smashed the
-   return address. Sized to the header plus a payload cap the tests stay well
-   under, and asserted rather than silently truncated. */
+   room for only 5 payload bytes -- so any test sending more wrote past the end
+   of the stack buffer and smashed the return address. Sized to the header plus
+   a payload cap the tests stay well under, and asserted rather than silently
+   truncated. */
 #define TEST_MAX_PAYLOAD 1024
 
 static void sendm(const char *topic, const uint8_t *p, size_t pl) {
@@ -183,27 +183,6 @@ static void t8(void){ TEST("handler: topic route");
     kill(pp,SIGKILL); kill(ap,SIGKILL); waitpid(pp,NULL,0); waitpid(ap,NULL,0);
 }
 
-static void t9(void){ TEST("registry: store tool");
-    free_ports(); cleanup();
-    char *a[]={"./bin/mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
-    pid_t pp=sp(a,e); ms(600);
-    system("rm -rf /tmp/tm9; mkdir -p /tmp/tm9");
-    char *aa[]={"./bin/actor",NULL},*ae[]={
-        "ACTOR_BUS_SUB=tcp://127.0.0.1:55656","ACTOR_BUS_PUB=tcp://127.0.0.1:55657",
-        "ACTOR_HEARTBEAT_MS=0","ACTOR_ID=a9","ACTOR_TOPIC=_tool_announce,_tool_discover","ACTOR_RESULT_TOPIC=_tool_list",
-        "ACTOR_HANDLER=./examples/employee-mesh/handlers/registry/tool-registry.sh",
-        "ACTOR_LMDB_PATH=/tmp/tm9",
-        "BRIDGE_LIB=./examples/employee-mesh/handlers/lib",NULL};
-    pid_t ap=sp(aa,ae); ms(600);
-    uint8_t mp[]={0x83,0xa4,'t','y','p','e',0xae,'_','t','o','o','l','_','a','n','n','o','u','n','c','e',
-        0xa5,'a','c','t','o','r',0xa2,'t','9',0xac,'c','a','p','a','b','i','l','i','t','i','e','s',
-        0x91,0x81,0xa4,'n','a','m','e',0xa1,'q'};
-    sendm("_tool_announce",mp,sizeof(mp)); ms(500);
-    FILE *f=fopen("/tmp/tm9/tools/t9.json","r");
-    CHECK(f!=NULL,"not stored"); if(f)fclose(f);
-    kill(pp,SIGKILL); kill(ap,SIGKILL); waitpid(pp,NULL,0); waitpid(ap,NULL,0);
-}
-
 static void t10(void){ TEST("heartbeat: actors emit");
     free_ports(); cleanup();
     char *a[]={"./bin/mesh-proxy",NULL},*e[]={"PROXY_SUB_BIND=tcp://127.0.0.1:55657","PROXY_PUB_BIND=tcp://127.0.0.1:55656",NULL};
@@ -252,7 +231,7 @@ static void t11(void){ TEST("actor: an unset emitted_at is stamped on arrival");
 
 int main(void){
     printf("Actor Mesh Test Suite\n\n");
-    t1(); t2(); t3(); t4(); t5(); t6(); t7(); t8(); t9(); t10(); t11();
-    printf("\n%s (%d/%d failures)\n",failures?"FAIL":"ALL PASSED",failures,11);
+    t1(); t2(); t3(); t4(); t5(); t6(); t7(); t8(); t10(); t11();
+    printf("\n%s (%d/%d failures)\n",failures?"FAIL":"ALL PASSED",failures,10);
     cleanup(); return failures;
 }

@@ -44,10 +44,9 @@ sudo dnf install nng-devel lmdb-devel gcc make
 
 # 3. Build
 make                                    # actor + proxy
-cd examples/employee-mesh && make       # handlers
 
-# 4. Start a mesh
-bash test-mcp-mesh.sh "how many employees?"
+# 4. Run the tests
+make test-mesh
 ```
 
 ## What Gets Built
@@ -56,9 +55,8 @@ bash test-mcp-mesh.sh "how many employees?"
 |--------|---------|
 | `bin/actor` | Runtime — forks handlers, manages LMDB, connects to mesh |
 | `bin/mesh-proxy` | Bus — forwards pub/sub messages, ~130 LOC |
-| `bin/llm-agent` | ReAct agent handler — calls LLM, uses tools |
 
-## Adding Your Own Agent
+## Adding Your Own Handler
 
 ```sh
 # 1. Write a handler (any language, stdin → stdout)
@@ -70,7 +68,7 @@ EOF
 chmod +x my-handler.sh
 
 # 2. Start it as an actor
-ACTOR_ID=my-agent \
+ACTOR_ID=my-actor \
 ACTOR_TOPIC=my_topic \
 ACTOR_RESULT_TOPIC=my_result \
 ACTOR_HANDLER=./my-handler.sh \
@@ -86,7 +84,7 @@ ACTOR_BUS_PUB=tcp://127.0.0.1:5557 \
 ## Tests
 
 ```sh
-make test-mesh               # 10/10 — proxy, actor, handler contract, TTL, registry
+make test-mesh               # 10/10 — proxy, actor, handler contract, TTL
 
 make test-concurrency        # ACTOR_CONCURRENCY and child reaping
 make test-isolation          # ACTOR_* confinement (Linux)
@@ -107,8 +105,8 @@ podman run --rm actor-test sh -c 'cd /src && ./bin/test-isolation'
 |------|------|
 | [DESIGN.md](DESIGN.md) | Architecture, tuple header, handler contract, memory model |
 | [SPEC.md](SPEC.md) | Formal specification (Z-notation schemas, procedures, predicates) |
-| [AGENTS.md](AGENTS.md) | Multi-agent patterns, tool discovery, LLM integration |
-| [START.md](START.md) | Getting started, troubleshooting, MCP tool auto-discovery |
+| [AGENTS.md](AGENTS.md) | Agent instructions for working in this repo |
+| [START.md](START.md) | Getting started and troubleshooting |
 | [DESIGN.md#isolation](DESIGN.md#isolation) | Optional process/tuple confinement — namespaces, Landlock, seccomp, cgroups |
 
 ## Lineage

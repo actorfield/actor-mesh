@@ -44,8 +44,8 @@ A concrete ReAct turn produces this graph:
 ```{mermaid}
 sequenceDiagram
   participant C  as client
-  participant AG as llm-agent
-  participant ST as sqlite-tool
+  participant AG as agent
+  participant ST as worker
 
   C  ->> AG : id=A  corr=X  caus=—
   AG ->> ST : id=B  corr=X  caus=A
