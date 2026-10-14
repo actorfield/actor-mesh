@@ -101,10 +101,8 @@ mesh-proxy: proxy/proxy.c runtime/bus.c runtime/bus.h | bin/
 actor-confine: tools/actor-confine.c runtime/actor_isolation.c runtime/actor_isolation.h | bin/
 	$(CC) $(CFLAGS) $(LDFLAGS) tools/actor-confine.c runtime/actor_isolation.c -o bin/actor-confine
 
-# Core mesh tests. The registry test drives the example tool registry, which
-# reads frames with the example mpack-get helper, so build that too.
+# Core mesh tests.
 test-mesh: actor mesh-proxy tests/test-mesh.c | bin/
-	$(MAKE) -C examples/employee-mesh handlers/lib/mpack-get
 	$(CC) $(CFLAGS) $(LDFLAGS) tests/test-mesh.c $(NNG_LIBS) -o bin/test-mesh
 	./bin/test-mesh
 

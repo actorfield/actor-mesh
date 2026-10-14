@@ -1,15 +1,17 @@
 # Quick Start
 
-The employee mesh is a working ReAct agent: a natural language question arrives, the agent generates SQL, the SQL tool executes it against SQLite, the result comes back, the agent answers. Five actors. One bus. Full PII tokenisation.
+Actor Mesh is a pub/sub bus, a runtime that forks a handler per tuple, and
+handlers that are any process speaking stdio. The `ping-pong` example is a
+complete two-actor mesh you can read end to end.
 
 ## Prerequisites
 
 ```sh
 # Debian/Ubuntu
-sudo apt install libnng-dev liblmdb-dev libcurl4-openssl-dev libsqlite3-dev libncursesw5-dev
+sudo apt install libnng-dev liblmdb-dev
 
 # Fedora/RHEL
-sudo dnf install nng-devel lmdb-devel libcurl-devel sqlite-devel ncurses-devel
+sudo dnf install nng-devel lmdb-devel gcc make
 ```
 
 If your distro doesn't package nng, vendor it:
@@ -20,156 +22,55 @@ cd vendor/nng && mkdir build && cd build && cmake .. && make -j$(nproc)
 # add -Ivendor/nng/include -Lvendor/nng/build to CFLAGS/LIBS
 ```
 
-An OpenAI-compatible LLM API (DeepSeek, OpenAI, or local Ollama):
-
-```sh
-# DeepSeek (recommended) — get a key at platform.deepseek.com
-export LLM_API_KEY=sk-...
-export LLM_MODEL=deepseek-chat
-
-# Or local Ollama
-export LLM_BASE_URL=http://localhost:11434
-export LLM_MODEL=gemma4:e2b
-```
-
-ONNX Runtime (for PII NER filtering):
-
-```sh
-# Fedora/RHEL
-sudo dnf install onnxruntime-devel
-
-# Debian/Ubuntu — not in apt, install from upstream release:
-curl -L https://github.com/microsoft/onnxruntime/releases/download/v1.20.1/onnxruntime-linux-x64-1.20.1.tgz \
-  | tar xz -C /tmp
-sudo mkdir -p /usr/include/onnxruntime
-sudo cp -r /tmp/onnxruntime-linux-x64-1.20.1/include/* /usr/include/onnxruntime/
-sudo cp /tmp/onnxruntime-linux-x64-1.20.1/lib/*.so* /usr/lib/
-sudo ldconfig
-```
-
-Python (for build tools only — the mesh itself is pure C):
-
-```sh
-pip install msgpack  # needed by export scripts
-```
-
 ## Build
 
 ```sh
-# 1. Build the runtime (actor + proxy)
+# Build the runtime (actor + proxy)
 make
-
-# 2. Build the employee-mesh demo (client, TUI, handlers)
-cd examples/employee-mesh
-make all
 ```
 
 This produces:
 
 ```
-actor                  — runtime binary
-mesh-proxy             — bus proxy (~57 lines)
-examples/employee-mesh/
-  client               — CLI query tool
-  tui                  — ncurses chat interface
-  handlers/
-    llm-agent          — ReAct agent (Ollama + LMDB)
-    sqlite-tool        — SQLite query executor
-    pii-filter         — NER mask/restore (ONNX)
+bin/actor       — runtime binary
+bin/mesh-proxy  — bus proxy
 ```
 
-## Run
+## Run the example
+
+`examples/ping-pong/` is a two-actor pub/sub mesh: `pub.c` publishes a `ping`
+tuple, `sub.c` subscribes to `pong`, and `ping-handler.sh` / `pong-handler.sh`
+answer each topic. See `run.sh` for the full wiring (it compiles `pub` and
+starts the proxy and two actors).
+
+## Configuration
+
+All behaviour is controlled by environment variables. See @appendix for the
+complete reference. An actor is wired entirely from the environment:
 
 ```sh
-cd examples/employee-mesh
-make run LLM_API_KEY=sk-... LLM_MODEL=deepseek-chat
+ACTOR_ID=my-actor \
+ACTOR_TOPIC=orders \
+ACTOR_RESULT_TOPIC=orders_done \
+ACTOR_HANDLER=./my-handler.sh \
+ACTOR_LMDB_PATH=/tmp/my-actor \
+ACTOR_BUS_SUB=tcp://127.0.0.1:5556 \
+ACTOR_BUS_PUB=tcp://127.0.0.1:5557 \
+./bin/actor &
 ```
-
-This starts 5 processes:
-
-| Process | Topic subscription | Role |
-|---------|-------------------|------|
-| `proxy` | — | Bus fanout (:5556/:5557) |
-| `tokenise-1` | `user_message`, `sql_result` | Mask PII before LLM |
-| `detokenise-1` | `sql_query_masked`, `agent_response_masked` | Restore PII after LLM |
-| `sqlite-tool-1` | `sql_query` | Execute SQL |
-| `llm-agent-1` | `user_message_masked`, `sql_result_masked` | ReAct agent (OpenAI-compatible LLM) |
-
-## Query
-
-```sh
-make query Q="who manages the Development department?"
-```
-
-Or use the client directly:
-
-```sh
-./client "how many employees in Development?"
-```
-
-## Chat
-
-```sh
-make chat
-```
-
-Opens the ncurses TUI. Type a question and press Enter. The agent explores the database, runs queries, and answers. Session history persists across turns in LMDB.
 
 ## Stop
 
 ```sh
-make stop
-```
-
-Kills all mesh processes and wipes LMDB state.
-
-## Pipeline
-
-```{mermaid}
-sequenceDiagram
-  participant C  as client
-  participant TK as tokenise
-  participant AG as llm-agent
-  participant DK as detokenise
-  participant DB as sqlite-tool
-
-  C  ->> TK : user_message
-  Note over TK: mask PII → tokens
-  TK ->> AG : user_message_masked
-  AG ->> DK : sql_query_masked
-  Note over DK: restore names in SQL
-  DK ->> DB : sql_query
-  DB ->> TK : sql_result
-  Note over TK: mask employee data
-  TK ->> AG : sql_result_masked
-  AG ->> DK : agent_response_masked
-  Note over DK: restore answer
-  DK ->> C  : agent_response
-```
-
-The LLM never sees real PII. Everything entering its context is tokenised (`TOK_PERSON_0001`). Everything it emits is detokenised before reaching the user or database. See @agents for the full PII Token Bubble design.
-
-## Configuration
-
-All behaviour is controlled by environment variables. See @appendix for the complete reference. The key ones:
-
-```sh
-# LLM backend (OpenAI-compatible)
-LLM_BASE_URL=https://api.deepseek.com   # or http://localhost:11434 for Ollama
-LLM_API_KEY=sk-...                      # not needed for Ollama
-LLM_MODEL=deepseek-chat                 # or gemma4:e2b for Ollama
-
-# PII filtering
-NER_MODEL_PATH=models/ner.onnx
-TOKENMAP_PATH=/tmp/actor-mesh/tokenmap
+fuser -k 5556/tcp 5557/tcp   # free the bus ports
 ```
 
 ## Troubleshooting
 
-**"No such file: handlers/pii-filter"** — run `make all` to build all handlers.
+**No response** — check that an actor is subscribed to your topic and publishing
+a result, and that its `ACTOR_BUS_SUB` / `ACTOR_BUS_PUB` point at the proxy.
 
-**"mdb_env_open: No such file or directory"** — the tokenmap directory wasn't created. `make run` should create it; if running actors manually, ensure `TOKENMAP_PATH` exists.
+**"mdb_env_open: No such file or directory"** — the actor's LMDB directory does
+not exist. Create the path in `ACTOR_LMDB_PATH` before starting the actor.
 
-**Client times out** — the ReAct loop can take 30-90 seconds with a local model. The client has a 10-minute timeout. For Ollama, check it is running: `curl http://localhost:11434/api/tags`. For remote APIs, verify your key with `curl https://api.deepseek.com/v1/models -H "Authorization: Bearer $LLM_API_KEY"`.
-
-**Port already in use** — `make stop` or `pkill mesh-proxy` to free ports 5556/5557.
+**Port already in use** — `fuser -k 5556/tcp 5557/tcp` or `pkill mesh-proxy`.

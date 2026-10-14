@@ -43,7 +43,7 @@ LMDB provides atomic commits — a crash mid-write leaves the previous state int
 Every actor emits a heartbeat tuple on a timer:
 
 ```json
-{"id": "sqlite-tool-1", "inbox": 0, "outbox": 0}
+{"id": "worker-1", "inbox": 0, "outbox": 0}
 ```
 
 Topic: `heartbeat` — TTL: 3× heartbeat interval — Default interval: 5 s

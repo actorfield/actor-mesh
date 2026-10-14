@@ -77,12 +77,3 @@ sql_query
 ```
 
 The runtime strips the first line and publishes the payload on that topic. One handler can fan out to multiple downstream actors without any runtime change.
-
-## PII Filter
-
-The `pii-filter` handler runs in two modes via a single C binary:
-
-- **Mask** (`PII_MODE=mask`): runs ONNX NER inference (spaCy CNN, 6 MB), replaces entity spans with `TOK_PERSON_0001`-style tokens, writes mappings to LMDB
-- **Restore** (`PII_MODE=restore`): scans for token patterns, looks up originals in LMDB, substitutes them back
-
-Both modes walk MessagePack recursively — strings at any nesting depth are processed transparently. The handler uses static buffers only (~844 KB total), no heap allocation per tuple. See @agents for the pipeline topology.

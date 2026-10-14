@@ -44,8 +44,8 @@ A concrete ReAct turn produces this graph:
 ```{mermaid}
 sequenceDiagram
   participant C  as client
-  participant AG as llm-agent
-  participant ST as sqlite-tool
+  participant AG as agent
+  participant ST as worker
 
   C  ->> AG : id=A  corr=X  caus=—
   AG ->> ST : id=B  corr=X  caus=A
@@ -54,3 +54,10 @@ sequenceDiagram
 ```
 
 Every tuple shares `corr=X`. Each `causation_id` points one hop back. A subscriber on `*` that records every tuple can reconstruct the full execution graph of any request — across any number of actors, any number of hops — with no tracing infrastructure, no sidecar, no instrumentation. The bus is the trace.
+
+## Codec
+
+The frame is also exposed to JavaScript as a WASM module, so a browser client
+can pack and parse tuples without reimplementing the layout: `wasm/actor_wasm.c`
+compiled with Emscripten to `actor-frame.js` / `actor-frame.wasm`, exporting
+`buildFrame`, `parseTopic`, `parsePayload`, `parseId`, `parseCausationId`.
