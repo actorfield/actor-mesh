@@ -109,6 +109,39 @@ predicate ValidFrame(buf : uint8*, len : ℕ) ≙
 payload(h : actor_header_t*) : uint8*  ≙  (uint8*)(h + 1)
 ```
 
+### 2.6 Frame Codec (WASM)
+
+```
+procedure BuildFrame(topic : char[tl], origin : char[ol],
+                     id : UUID, payload : char[pl],
+                     output : uint8[256+pl]) : ℕ:
+  { post: return = 256 + pl
+          ∧ output[0..31]   = topic padded with nulls
+          ∧ output[32..47]  = id
+          ∧ output[80..111] = origin padded with nulls
+          ∧ output[138..141]= pl (uint32 LE)
+          ∧ output[256..]   = payload                              }
+
+procedure ParseTopic(frame : uint8*, flen : ℕ, out : char[33]):
+  if flen < 256: out ← ""; return
+  out[0..31] ← frame[0..31]; out[32] ← '\0'
+
+procedure ParsePayload(frame : uint8*, flen : ℕ,
+                       out : uint8*) : ℕ:
+  if flen < 256: return 0
+  plen ← clamp(*(uint32*)(frame + 132), flen − 256)
+  memcpy(out, frame + 256, plen)
+  return plen
+
+procedure ParseId(frame : uint8*, flen : ℕ, out : UUID):
+  if flen < 256: out ← 0₁₆; return
+  memcpy(out, frame + 32, 16)
+
+procedure ParseCausationId(frame : uint8*, flen : ℕ, out : UUID):
+  if flen < 256: out ← 0₁₆; return
+  memcpy(out, frame + 64, 16)
+```
+
 ---
 
 ## §3 Actor Runtime State
@@ -771,77 +804,9 @@ predicate TopicMatch(msg_topic : Topic, sub_topic : Topic) ≙
 
 ---
 
-## §10 WASM Actor Model
+## §10 Configuration Schema
 
-### 10.1 State
-
-```
-┌─ WasmActorState ────────────────────────────────────────────────────┐
-│ ws          : EMSCRIPTEN_WEBSOCKET_T  — WebSocket to proxy          │
-│ origin      : "browser"               — fixed origin string         │
-│ callbacks   : Topic ⇸ (JSON → void)   — JS callback registry        │
-├─────────────────────────────────────────────────────────────────────┤
-│ Transport: WebSocket binary frames                                  │
-│ Frame format: identical to actor_header_t + payload                 │
-│ UUID source: crypto.getRandomValues() via EM_ASM                    │
-│ Timestamp:   emscripten_get_now() × 10⁶ (micro → nano)             │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### 10.2 Exports
-
-```
-procedure actor_init(url : char[*]) : {0, −1}:
-  connect WebSocket to url
-  register onopen, onmessage, onerror callbacks
-  return 0 if connected, −1 otherwise
-
-procedure actor_request(topic : char[*], payload : char[*]):
-  BuildFrame(topic, origin, uuid4(), payload)
-  ws.send_binary(frame)
-
-procedure actor_poll():
-  — no-op, WebSocket events are async
-```
-
-### 10.3 WASM Frame Builder (standalone)
-
-```
-procedure BuildFrame(topic : char[tl], origin : char[ol],
-                     id : UUID, payload : char[pl],
-                     output : uint8[256+pl]) : ℕ:
-  { post: return = 256 + pl
-          ∧ output[0..31]   = topic padded with nulls
-          ∧ output[32..47]  = id
-          ∧ output[80..111] = origin padded with nulls
-          ∧ output[138..141]= pl (uint32 LE)
-          ∧ output[256..]   = payload                              }
-
-procedure ParseTopic(frame : uint8*, flen : ℕ, out : char[33]):
-  if flen < 256: out ← ""; return
-  out[0..31] ← frame[0..31]; out[32] ← '\0'
-
-procedure ParsePayload(frame : uint8*, flen : ℕ,
-                       out : uint8*) : ℕ:
-  if flen < 256: return 0
-  plen ← clamp(*(uint32*)(frame + 132), flen − 256)
-  memcpy(out, frame + 256, plen)
-  return plen
-
-procedure ParseId(frame : uint8*, flen : ℕ, out : UUID):
-  if flen < 256: out ← 0₁₆; return
-  memcpy(out, frame + 32, 16)
-
-procedure ParseCausationId(frame : uint8*, flen : ℕ, out : UUID):
-  if flen < 256: out ← 0₁₆; return
-  memcpy(out, frame + 64, 16)
-```
-
----
-
-## §11 Configuration Schema
-
-### 11.1 Actor Environment Variables
+### 10.1 Actor Environment Variables
 
 ```
 ┌─ ActorEnv ──────────────────────────────────────────────────────────┐
@@ -862,7 +827,7 @@ procedure ParseCausationId(frame : uint8*, flen : ℕ, out : UUID):
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 11.2 Proxy Environment Variables
+### 10.2 Proxy Environment Variables
 
 ```
 ┌─ ProxyEnv ──────────────────────────────────────────────────────────┐
@@ -877,9 +842,9 @@ procedure ParseCausationId(frame : uint8*, flen : ℕ, out : UUID):
 
 ---
 
-## §12 Build Model
+## §11 Build Model
 
-### 12.1 Compilation Units
+### 11.1 Compilation Units
 
 ```
 ┌─ BuildGraph ────────────────────────────────────────────────────────┐
@@ -900,7 +865,7 @@ procedure ParseCausationId(frame : uint8*, flen : ℕ, out : UUID):
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 12.2 Vendored Dependencies
+### 11.2 Vendored Dependencies
 
 ```
 vendor/
@@ -915,7 +880,7 @@ Runtime source:        0 vendored deps (only nng + lmdb, linked dynamically)
 UI:                    clay.h + SDL2
 ```
 
-### 12.3 Target Invariants
+### 11.3 Target Invariants
 
 ```
 ┌─ Build Invariants ──────────────────────────────────────────────────┐
@@ -934,9 +899,9 @@ UI:                    clay.h + SDL2
 
 ---
 
-## §13 Test Model
+## §12 Test Model
 
-### 13.1 Test Suite
+### 12.1 Test Suite
 
 ```
 test-mesh.c  — 10 integration tests
@@ -952,7 +917,7 @@ test-mesh.c  — 10 integration tests
   10. heartbeat: actors emit   — heartbeat messages are published
 ```
 
-### 13.2 Test Invariants
+### 12.2 Test Invariants
 
 ```
 ┌─ Test Invariants ───────────────────────────────────────────────────┐
