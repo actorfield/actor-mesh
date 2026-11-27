@@ -47,8 +47,11 @@ static void cleanup(void) {
 
 static pid_t sp_(char **a, char **e) { pid_t p; if (posix_spawn(&p, a[0], NULL, NULL, a, e)) return -1; return p; }
 
+/* For elapsed times and deadlines, so monotonic: the wall clock can step while
+   a test runs (a VM's time sync), and a step back once made three serial 400ms
+   handlers look like they took 429ms. Frame timestamps use the wall clock. */
 static int64_t now_ms(void) {
-    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
 }
 
