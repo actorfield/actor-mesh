@@ -30,6 +30,7 @@
 #include <time.h>
 
 #ifndef _WIN32
+#  include <fcntl.h>
 #  include <pthread.h>
 #  include <sys/wait.h>
 #endif
@@ -258,7 +259,7 @@ static int lane_of(const char topic[32]) {
 
 static nng_socket nng_pub;
 #ifndef _WIN32
-static nng_socket nng_ctl;   /* control topics, read by the reaper */
+static nng_socket nng_ctl;   /* control topics, read by the control thread */
 #endif
 static MDB_env*   mdb_env;
 static MDB_dbi    dbi_inbox;
@@ -287,7 +288,27 @@ static int64_t mono_ms(void) {
 
 /* ── Signal ──────────────────────────────────────────────────────────────── */
 
-static void on_signal(int s) { (void)s; g_stop = 1; }
+#ifndef _WIN32
+/* Stopping wakes what waits. The lanes and the control socket receive with no
+   timeout -- a timeout only so a loop could notice g_stop was a timer armed
+   and expired several hundred times a second per actor, doing nothing -- so a
+   stop closes their sockets instead, which ends every blocked receive at once.
+   nng_close is not safe in a signal handler; write() is: the handler writes a
+   byte to a pipe and the stopper thread, woken by it, does the closing. */
+static int g_stop_pipe[2] = { -1, -1 };
+
+static void request_stop(void) {
+    g_stop = 1;
+    if (g_stop_pipe[1] >= 0) {
+        char c = 0;
+        (void)!write(g_stop_pipe[1], &c, 1);
+    }
+}
+#else
+static void request_stop(void) { g_stop = 1; }
+#endif
+
+static void on_signal(int s) { (void)s; request_stop(); }
 
 /* ── NNG ─────────────────────────────────────────────────────────────────── */
 
@@ -313,8 +334,9 @@ static int nng_setup(void) {
 
     /* One SUB socket per lane. NNG sub0 prefix-matches on the message body and
      * the topic sits at offset 0 of actor_header_t, so each topic is subscribed
-     * with its null terminator for an exact match. The 100ms receive timeout is
-     * how a worker notices g_stop. */
+     * with its null terminator for an exact match. A worker blocks until a
+     * tuple comes or a stop closes the socket (see request_stop); on Windows,
+     * with no stopper thread, a 100ms timeout is how it notices g_stop. */
     for (int i = 0; i < g_nlanes; i++) {
         lane_t* l = &g_lanes[i];
         if ((rc = nng_sub0_open(&l->sub)) != 0) {
@@ -331,7 +353,9 @@ static int nng_setup(void) {
                 return -1;
             }
         }
+#ifdef _WIN32
         nng_socket_set_ms(l->sub, NNG_OPT_RECVTIMEO, 100);
+#endif
     }
 
 #ifndef _WIN32
@@ -610,15 +634,29 @@ static void term_matching(const actor_header_t* req) {
     pthread_mutex_unlock(&child_mu);
 }
 
-/* Only the header matters, so a fixed buffer is enough: nng_recv copies what
-   fits and reports the full length. */
-static void control_poll(void) {
+/* Control thread: `_term` requests, as they come. It blocks on its own socket,
+   so a _term arrives when every worker is busy, and ends when shutdown closes
+   that socket. Only the header matters, so a fixed buffer is enough: nng_recv
+   copies what fits and reports the full length. */
+static void* control_main(void* arg) {
+    (void)arg;
     uint8_t buf[sizeof(actor_header_t)];
-    size_t  sz = sizeof(buf);
-    while (nng_recv(nng_ctl, buf, &sz, NNG_FLAG_NONBLOCK) == 0) {
-        if (sz >= sizeof(actor_header_t)) term_matching((const actor_header_t*)buf);
-        sz = sizeof(buf);
+    for (;;) {
+        size_t sz = sizeof(buf);
+        int    rc = nng_recv(nng_ctl, buf, &sz, 0);
+        if (rc == NNG_ECLOSED) return NULL;
+        if (rc == 0 && sz >= sizeof(actor_header_t)) term_matching((const actor_header_t*)buf);
     }
+}
+
+/* Stopper thread: waits for a stop (request_stop), then closes the lanes'
+   sockets, which ends the workers' blocked receives. */
+static void* stopper_main(void* arg) {
+    (void)arg;
+    char c;
+    while (read(g_stop_pipe[0], &c, 1) < 0 && errno == EINTR) {}
+    for (int i = 0; i < g_nlanes; i++) nng_close(g_lanes[i].sub);
+    return NULL;
 }
 
 static void escalate_kills(void) {
@@ -729,7 +767,7 @@ static void service_reaped(pid_t pid, int status) {
             fprintf(stderr, "[actor] service %s restarted %d times in %ds; giving up\n",
                     s->name, SERVICE_RESTARTS, SERVICE_WINDOW_MS / 1000);
             atomic_store(&g_services_failed, 1);
-            g_stop = 1;
+            request_stop();
             return;
         }
         s->recent[s->restarts++ % SERVICE_RESTARTS] = now;
@@ -830,6 +868,10 @@ static int bus_host(void) {
         fprintf(stderr, "[actor] bus: %s\n", nng_strerror(rc));
         return -1;
     }
+    /* No receive timeout: the forwarder waits for traffic, and bus_unhost
+       closes the socket to end the wait (the proxy binary keeps bus_open's
+       timeout, which paces its heartbeat). */
+    nng_socket_set_ms(g_bus.sub, NNG_OPT_RECVTIMEO, NNG_DURATION_INFINITE);
     if (pthread_create(&g_bus_thread, NULL, bus_main, NULL) != 0) {
         fprintf(stderr, "[actor] could not start the bus thread\n");
         bus_close(&g_bus);
@@ -842,6 +884,7 @@ static int bus_host(void) {
 static void bus_unhost(void) {
     if (!g_bus_hosted) return;
     atomic_store(&g_bus_stop, 1);
+    nng_close(g_bus.sub); /* ends the forwarder's wait */
     pthread_join(g_bus_thread, NULL);
     bus_close(&g_bus);
 }
@@ -850,7 +893,6 @@ static void bus_unhost(void) {
 static void* reaper_main(void* arg) {
     (void)arg;
     while (!atomic_load(&g_reaper_stop)) {
-        control_poll();
         escalate_kills();
         heartbeat_tick();
         int   status;
@@ -1443,6 +1485,16 @@ int actor_run(void) {
     if (run_init() < 0 || bus_host() < 0) return -1;
 #endif
 
+#ifndef _WIN32
+    /* Before the handlers can fire. Close-on-exec, so handlers do not hold
+       it; the write end non-blocking, so a handler never blocks on it. */
+    if (pipe(g_stop_pipe) < 0 ||
+        fcntl(g_stop_pipe[0], F_SETFD, FD_CLOEXEC) < 0 || fcntl(g_stop_pipe[1], F_SETFD, FD_CLOEXEC) < 0 ||
+        fcntl(g_stop_pipe[1], F_SETFL, O_NONBLOCK) < 0) {
+        fprintf(stderr, "[actor] stop pipe: %s\n", strerror(errno));
+        return -1;
+    }
+#endif
     signal(SIGTERM, on_signal);
     signal(SIGINT,  on_signal);
 
@@ -1463,10 +1515,15 @@ int actor_run(void) {
        messages sweep used to do. */
     for (int i = 0; i < g_nservices; i++) service_spawn(&g_services[i]);
 
-    pthread_t reaper;
+    pthread_t reaper, control, stopper;
     int reaper_started = (pthread_create(&reaper, NULL, reaper_main, NULL) == 0);
     if (!reaper_started) {
         fprintf(stderr, "[actor] FATAL: could not start reaper thread\n");
+        return -1;
+    }
+    if (pthread_create(&control, NULL, control_main, NULL) != 0 ||
+        pthread_create(&stopper, NULL, stopper_main, NULL) != 0) {
+        fprintf(stderr, "[actor] FATAL: could not start the control or stopper thread\n");
         return -1;
     }
 
@@ -1493,7 +1550,9 @@ int actor_run(void) {
 
     fprintf(stderr, "[actor] shutting down\n");
 #ifndef _WIN32
-    g_stop = 1;
+    /* However this loop ended, wake every worker still waiting. */
+    request_stop();
+    pthread_join(stopper, NULL);
     for (int i = 0; i < nworkers; i++) pthread_join(workers[i], NULL);
     atomic_store(&g_reaper_stop, 1);
     pthread_join(reaper, NULL);
@@ -1502,6 +1561,7 @@ int actor_run(void) {
     for (int i = 0; i < g_nlanes; i++) nng_close(g_lanes[i].sub);
 #ifndef _WIN32
     nng_close(nng_ctl);
+    pthread_join(control, NULL);
     bus_unhost();
 #endif
     mdb_env_close(mdb_env);
